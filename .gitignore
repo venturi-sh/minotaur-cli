@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+
+# Scan output
+*.findings.json
+findings.json
+
+.DS_Store
+*.log

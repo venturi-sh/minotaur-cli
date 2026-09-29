@@ -1,0 +1,220 @@
+/**
+ * What a person reads in the terminal. Machine-readable output is `--json`;
+ * this is for eyes, so it favours short lines over completeness.
+ */
+
+import { readFile } from 'node:fs/promises';
+
+import { findingSchema, focusSchema, type Severity } from './core/index.js';
+import { z } from 'zod';
+
+import { decisionSchema, isClosed } from './decisions.js';
+import type { LocalFinding, SourceOutcome } from './sources.js';
+import type { TriageResult } from './triage.js';
+
+export interface Style {
+  bold(text: string): string;
+  dim(text: string): string;
+  inverse(text: string): string;
+  red(text: string): string;
+  green(text: string): string;
+  yellow(text: string): string;
+  severity(severity: Severity, text: string): string;
+}
+
+const same = (text: string) => text;
+export const PLAIN: Style = { bold: same, dim: same, inverse: same, red: same, green: same, yellow: same, severity: (_s, t) => t };
+
+const SEVERITY_COLOR: Record<Severity, number> = { critical: 35, high: 31, medium: 33, low: 36, info: 2, unknown: 2 };
+
+export const COLOR: Style = {
+  bold: (t) => `\u001b[1m${t}\u001b[22m`,
+  dim: (t) => `\u001b[2m${t}\u001b[22m`,
+  inverse: (t) => `\u001b[7m${t}\u001b[27m`,
+  red: (t) => `\u001b[31m${t}\u001b[39m`,
+  green: (t) => `\u001b[32m${t}\u001b[39m`,
+  yellow: (t) => `\u001b[33m${t}\u001b[39m`,
+  severity: (s, t) => `\u001b[${SEVERITY_COLOR[s]}m${t}\u001b[39m`,
+};
+
+export function locationOf(finding: {
+  location?: { path: string; startLine?: number | undefined; endLine?: number | undefined } | null | undefined;
+}): string {
+  const location = finding.location;
+  if (!location) return '';
+  if (!location.startLine) return location.path;
+  const end = location.endLine && location.endLine !== location.startLine ? `-${location.endLine}` : '';
+  return `${location.path}:${location.startLine}${end}`;
+}
+
+export function toolsOf(finding: LocalFinding): string {
+  return (finding.tools.length > 0 ? finding.tools : [finding.tool]).map((tool) => tool.name).join(',');
+}
+
+/** One line of exactly `width` characters: whitespace collapsed, padded, or cut with an ellipsis. */
+export function fit(text: string, width: number): string {
+  if (width <= 0) return '';
+  const single = text.replace(/\s+/g, ' ').trim();
+  return single.length <= width ? single.padEnd(width) : `${single.slice(0, Math.max(0, width - 1))}…`;
+}
+
+export function renderFindingTable(findings: readonly LocalFinding[], style: Style, width = 120): string {
+  if (findings.length === 0) return 'No findings.';
+  const kindWidth = 6;
+  const severityWidth = 8;
+  const toolWidth = Math.min(20, Math.max(4, ...findings.map((finding) => toolsOf(finding).length)));
+  const fixed = 2 + 8 + 2 + severityWidth + 2 + kindWidth + 2 + toolWidth + 2;
+  const flexible = Math.max(30, width - fixed);
+  const titleWidth = Math.ceil(flexible * 0.55);
+  const locationWidth = flexible - titleWidth - 2;
+
+  const header = [
+    ' ',
+    fit('ID', 8),
+    fit('SEVERITY', severityWidth),
+    fit('KIND', kindWidth),
+    fit('TOOL', toolWidth),
+    fit('TITLE', titleWidth),
+    'LOCATION',
+  ].join('  ');
+  const rows = findings.map((finding) =>
+    [
+      isClosed(finding) ? style.dim('✓') : finding.focus === 'likely' ? style.yellow('!') : ' ',
+      finding.id,
+      style.severity(finding.severity, fit(finding.severity, severityWidth)),
+      fit(finding.kind, kindWidth),
+      fit(toolsOf(finding), toolWidth),
+      fit(finding.title, titleWidth),
+      fit(locationOf(finding), locationWidth).trimEnd(),
+    ].join('  '),
+  );
+  const legend = [
+    ...(findings.some((finding) => finding.focus === 'likely' && !isClosed(finding)) ? [`${style.yellow('!')} likely an issue`] : []),
+    ...(findings.some(isClosed) ? ['✓ marked false positive, accepted risk or fixed'] : []),
+  ];
+  if (legend.length > 0) return [style.bold(header), ...rows, style.dim(legend.join('   '))].join('\n');
+  return [style.bold(header), ...rows].join('\n');
+}
+
+export function renderSummary(findings: readonly LocalFinding[], belowSeverity: number, ignored = 0, extra: readonly string[] = []): string {
+  const counts = new Map<string, number>();
+  for (const finding of findings) counts.set(finding.severity, (counts.get(finding.severity) ?? 0) + 1);
+  const parts = ['critical', 'high', 'medium', 'low', 'info', 'unknown']
+    .filter((severity) => counts.has(severity))
+    .map((severity) => `${counts.get(severity)} ${severity}`);
+  const total = `${findings.length} finding${findings.length === 1 ? '' : 's'}`;
+  const notes = [
+    ...(belowSeverity > 0 ? [`${belowSeverity} below the severity filter not shown`] : []),
+    ...extra,
+    ...(ignored > 0 ? [`${ignored} in files git ignores not shown (--include-ignored shows them)`] : []),
+  ];
+  return `${total}${parts.length > 0 ? ` (${parts.join(', ')})` : ''}${notes.map((note) => `, ${note}`).join('')}.`;
+}
+
+export function renderSourceOutcome(outcome: SourceOutcome): string {
+  const seconds = (outcome.durationMs / 1000).toFixed(1);
+  if (outcome.status === 'ok') return `  ${outcome.source}: ${outcome.findings} findings in ${seconds}s`;
+  if (outcome.status === 'skipped') return `  ${outcome.source}: skipped, ${outcome.error}`;
+  return `  ${outcome.source}: failed, ${outcome.error}`;
+}
+
+const ANSWER_LABEL: Record<string, string> = {
+  exploitable: 'EXPLOITABLE',
+  not_exploitable: 'NOT EXPLOITABLE',
+  undetermined: 'UNDETERMINED',
+};
+
+export function renderTriageResult(result: TriageResult, style: Style): string {
+  const finding = result.finding;
+  const lines = [
+    `${style.bold(finding.id)}  ${style.severity(finding.severity as Severity, finding.severity)}  ${finding.kind}  ${finding.tools.join(', ')}`,
+    `  ${finding.title}${finding.location ? `  ${style.dim(locationOf(finding))}` : ''}`,
+    '',
+  ];
+
+  if (result.status !== 'succeeded' || !result.exploitability) {
+    const why = result.status === 'skipped_budget' ? 'the budget ran out' : 'the check failed';
+    lines.push(`${style.bold('No answer')}: ${why}${result.error ? `, ${result.error}` : ''}.`);
+  } else {
+    const confidence = result.confidence === null ? '' : `  (confidence ${result.confidence.toFixed(2)})`;
+    lines.push(`${style.bold(ANSWER_LABEL[result.exploitability] ?? result.exploitability)}${confidence}`);
+    if (result.downgraded) lines.push(style.dim('  Downgraded because none of its citations matched the code.'));
+    if (result.entryPoint) lines.push('', `${style.bold('Entry point')}: ${result.entryPoint}`);
+    if (result.preconditions.length > 0) {
+      lines.push('', style.bold('Preconditions'), ...result.preconditions.map((item) => `  - ${item}`));
+    }
+    if (result.rationale) lines.push('', style.bold('Why'), ...indent(result.rationale));
+    if (result.evidence.length > 0) {
+      lines.push('', style.bold('Evidence'));
+      for (const item of result.evidence) {
+        const span = item.endLine === item.startLine ? `${item.startLine}` : `${item.startLine}-${item.endLine}`;
+        lines.push(`  ${item.path}:${span}`, ...item.quote.split('\n').slice(0, 6).map((line) => style.dim(`    ${line}`)));
+      }
+    }
+    if (result.openQuestions.length > 0) {
+      lines.push('', style.bold('Still open'), ...result.openQuestions.map((item) => `  - ${item}`));
+    }
+  }
+
+  if (result.rejectedEvidence.length > 0) {
+    const count = result.rejectedEvidence.length;
+    lines.push('', style.dim(`${count} citation${count === 1 ? ' was' : 's were'} dropped because the code did not match.`));
+  }
+  lines.push('', style.dim(usageLine(result)));
+  return lines.join('\n');
+}
+
+export function usageLine(result: Pick<TriageResult, 'steps' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'model'>): string {
+  const tokens = `${result.inputTokens.toLocaleString('en-US')} input and ${result.outputTokens.toLocaleString('en-US')} output tokens`;
+  const cost = result.costUsd > 0 ? `, $${result.costUsd.toFixed(2)}` : '';
+  return `${result.steps} step${result.steps === 1 ? '' : 's'}, ${tokens}${cost}, ${result.model}`;
+}
+
+function indent(text: string): string[] {
+  return text.split('\n').map((line) => (line.trim() ? `  ${line}` : ''));
+}
+
+export const findingsFileSchema = z.object({
+  version: z.literal(1),
+  root: z.string(),
+  /** The commit scanned, or null outside git. Missing in files from before commits were recorded. */
+  commit: z.string().nullable().default(null),
+  findings: z.array(
+    findingSchema.omit({ raw: true }).extend({
+      id: z.string(),
+      focus: focusSchema.optional(),
+      focusReasons: z.array(z.string()).optional(),
+      riskScore: z.number().optional(),
+      epss: z.number().optional(),
+      kev: z.boolean().optional(),
+      decision: decisionSchema.optional(),
+    }),
+  ),
+  /** Files with a detected secret, including ones whose finding was filtered out of `findings`. */
+  protectedPaths: z.array(z.string()).default([]),
+});
+export type FindingsFile = z.infer<typeof findingsFileSchema>;
+
+export function toFindingsFile(
+  root: string,
+  commit: string | null,
+  findings: readonly LocalFinding[],
+  sources: readonly SourceOutcome[],
+  protectedPaths: readonly string[],
+) {
+  return { version: 1 as const, root, commit, sources, protectedPaths, findings };
+}
+
+export async function readFindingsFile(
+  path: string,
+): Promise<{ findings: LocalFinding[]; protectedPaths: string[]; commit: string | null }> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(path, 'utf8'));
+  } catch (error) {
+    throw new Error(`could not read ${path}: ${(error as Error).message}`);
+  }
+  const parsed = findingsFileSchema.safeParse(raw);
+  if (!parsed.success) throw new Error(`${path} is not the JSON output of "minotaur scan --json"`);
+  return { findings: parsed.data.findings, protectedPaths: parsed.data.protectedPaths, commit: parsed.data.commit };
+}
