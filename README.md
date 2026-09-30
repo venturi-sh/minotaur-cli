@@ -121,3 +121,7 @@ pnpm typecheck
 pnpm test
 pnpm build            # dist/minotaur.js, one file that runs with plain node
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
