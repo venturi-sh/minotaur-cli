@@ -535,13 +535,18 @@ describe('fixes from an earlier run', () => {
             ],
           ]),
           message: '1 finding has a fix on branch minotaur/fixes-3f9a1c2, not merged yet; merge it to close it.',
+          results: new Map([[finding.fingerprint, result()]]),
         },
         input,
         output,
       }),
     );
     await tick();
-    expect(screen()).toContain('⎇ fix on branch');
+    // The check and the fix are separate: the row shows both.
+    const row = screen().split('\n').find((line) => line.includes(finding.id))!;
+    expect(row).toContain('▲ exploitable');
+    expect(row).toContain('⎇ on branch');
+    expect(screen()).toContain('FIX');
     expect(screen()).toContain('not merged yet; merge it to close it');
     input.write('\r');
     await tick();

@@ -62,10 +62,6 @@ export function checkLabel(state: BrowserState, finding: LocalFinding): CheckLab
   if (state.running?.fingerprint === finding.fingerprint) return { text: 'checking', color: ACCENT, running: true };
   const position = queuePosition(state, finding);
   if (position !== null) return { text: `◷ queued #${position}`, color: ACCENT, dim: true };
-  if (state.fixing?.current === finding.id) return { text: 'fixing', color: ACCENT, running: true };
-  // Fixed on a branch outranks the rest: the finding is still in this commit, but the work is done.
-  const fix = state.fixes.get(finding.fingerprint);
-  if (fix?.commit) return { text: '⎇ fix on branch', color: 'green', bold: true };
   // A person's decision outranks the model's answer.
   if (finding.decision?.state === 'confirmed') return { text: '● confirmed', color: 'red', bold: true };
   if (finding.decision) return { text: `✓ ${DECISION_LABEL[finding.decision.state]}`, color: 'green', dim: true };
@@ -196,6 +192,31 @@ export const FIX_LABEL: Record<FixView['status'], { text: string; color: string 
   not_tried: { text: 'Not tried', color: 'gray' },
   skipped: { text: 'Skipped', color: 'gray' },
 };
+
+/**
+ * The FIX column. Kept apart from the check: a finding can be checked and
+ * fixed, or only one of them, in either order.
+ */
+export function fixLabel(state: BrowserState, finding: LocalFinding): CheckLabel {
+  if (state.fixing?.current === finding.id) return { text: 'fixing', color: ACCENT, running: true };
+  const fix = state.fixes.get(finding.fingerprint);
+  if (!fix) return { text: '' };
+  switch (fix.status) {
+    case 'fixed':
+      return { text: '⎇ on branch', color: 'green', bold: true };
+    case 'committed_unverified':
+      return { text: '⎇ unverified', color: 'yellow' };
+    case 'unverified':
+      return { text: '? not verified', color: 'yellow' };
+    case 'skipped':
+      return { text: "– can't fix", dim: true };
+    case 'not_tried':
+    case 'stopped_at_cap':
+      return { text: '· not tried', dim: true };
+    default:
+      return { text: '✗ not fixed', color: 'red' };
+  }
+}
 
 /** The outcome, where the commit is, and the patch with its added and removed lines colored. Added to `lines`. */
 function addFix(

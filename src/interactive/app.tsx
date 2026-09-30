@@ -22,6 +22,7 @@ import {
   ACCENT,
   SEVERITY_COLOR,
   checkLabel,
+  fixLabel,
   detailLines,
   layoutFor,
   markingPrompt,
@@ -553,6 +554,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
         <Cell width={10} text="SEVERITY" dim bold />
         {wide && <Cell width={6} text="KIND" dim bold />}
         <Cell width={17} text="CHECK" dim bold />
+        <Cell width={14} text="FIX" dim bold />
         {wide && <Cell width={tool} text="TOOL" dim bold />}
         <Cell grow={3} text="TITLE" dim bold />
         {medium && <Cell grow={2} text="LOCATION" dim bold />}
@@ -569,6 +571,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
       {rows.map((finding, index) => {
         const selected = state.top + index === state.cursor;
         const check = checkLabel(state, finding);
+        const fix = fixLabel(state, finding);
         return (
           <Box key={finding.fingerprint} height={1} columnGap={2} {...(selected ? { backgroundColor: '#2d2d44' } : {})}>
             <Box width={1}>
@@ -594,6 +597,15 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
               ) : (
                 <Text wrap="truncate-end" {...styleProps(check)}>
                   {check.text}
+                </Text>
+              )}
+            </Box>
+            <Box width={14} flexShrink={0} overflow="hidden">
+              {fix.running ? (
+                <Spinner label={fix.text} />
+              ) : (
+                <Text wrap="truncate-end" {...styleProps(fix)}>
+                  {fix.text}
                 </Text>
               )}
             </Box>
