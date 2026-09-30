@@ -5,27 +5,28 @@ fix it on a branch. Everything runs on your machine.
 
 ## Install
 
-Needs Node 22, pnpm 10 and git. Minotaur only scans a git repository with at least one
-commit. For a folder without git, make a snapshot first:
+Needs Node 22 and git.
+
+```bash
+npm install -g minotaur-cli     # installs the minotaur command
+```
+
+Minotaur only scans a git repository with at least one commit. For a folder without git, make a
+snapshot first:
 
 ```bash
 git init && git add -A && git commit -m snapshot
 ```
 
-```bash
-pnpm install
-pnpm build            # dist/minotaur.js, runs with plain node
-```
-
 ## Use
 
 ```bash
-pnpm minotaur                                   # browse the findings in this repository
-pnpm minotaur scan ~/code/shop                  # list findings
-pnpm minotaur triage 3f9a1c2e ~/code/shop       # is this one exploitable?
-pnpm minotaur mark 3f9a1c2e false-positive --reason "Test fixture"
-pnpm minotaur fix 3f9a1c2e                      # fix it: one commit on the branch minotaur/fixes
-pnpm minotaur fix --all                         # fix everything scan lists, one commit each
+minotaur                                   # browse the findings in this repository
+minotaur scan ~/code/shop                  # list findings
+minotaur triage 3f9a1c2e ~/code/shop       # is this one exploitable?
+minotaur mark 3f9a1c2e false-positive --reason "Test fixture"
+minotaur fix 3f9a1c2e                      # fix it: one commit on the branch minotaur/fixes
+minotaur fix --all                         # fix everything scan lists, one commit each
 ```
 
 In the browser, press `t` to check a finding, `f` to fix it, `F` to fix all findings shown (the footer shows how many), `m`
@@ -91,7 +92,7 @@ export ANTHROPIC_API_KEY=...
 Or any server that speaks the OpenAI chat API, such as Ollama:
 
 ```bash
-pnpm minotaur triage 3f9a1c2e --model openai-compatible:qwen3-coder --base-url http://localhost:11434/v1
+minotaur triage 3f9a1c2e --model openai-compatible:qwen3-coder --base-url http://localhost:11434/v1
 ```
 
 Shared settings go in `.minotaur.yml` at the repository root. API keys go only in environment
@@ -111,7 +112,12 @@ variables.
 
 ## Develop
 
+Needs pnpm 10.
+
 ```bash
+pnpm install
+pnpm minotaur --help  # runs from source
 pnpm typecheck
 pnpm test
+pnpm build            # dist/minotaur.js, one file that runs with plain node
 ```

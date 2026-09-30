@@ -16,6 +16,8 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
+import packageJson from '../package.json' with { type: 'json' };
+
 import { FOCUS_LEVELS, SEVERITIES, focusRank, severityRank, type Focus, type Severity } from './core/index.js';
 
 import { advisoryCacheDir, lookupAdvisories, rankFindings } from './advisories.js';
@@ -98,7 +100,8 @@ import {
 } from './worktree.js';
 import type { FixView } from './interactive/state.js';
 
-const VERSION = '0.1.0';
+// From package.json, so a release cannot report the wrong version.
+const VERSION = packageJson.version;
 
 /** What a run of several fixes may spend before Minotaur asks whether to go on. */
 const DEFAULT_MAX_TOTAL_USD = 10;

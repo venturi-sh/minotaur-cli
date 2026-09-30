@@ -7,7 +7,7 @@ settings:
 importers:
 
   .:
-    dependencies:
+    devDependencies:
       '@ai-sdk/anthropic':
         specifier: ^4.0.58
         version: 4.0.60(zod@4.6.5)
@@ -17,22 +17,6 @@ importers:
       '@inkjs/ui':
         specifier: ^2.0.0
         version: 2.0.0(ink@7.1.1(@types/react@19.3.0)(react@19.3.0))
-      ai:
-        specifier: ^7.0.107
-        version: 7.0.111(zod@4.6.5)
-      ink:
-        specifier: ^7.1.1
-        version: 7.1.1(@types/react@19.3.0)(react@19.3.0)
-      react:
-        specifier: ^19.2.8
-        version: 19.3.0
-      yaml:
-        specifier: ^2.9.1
-        version: 2.9.1
-      zod:
-        specifier: ^4.4.3
-        version: 4.6.5
-    devDependencies:
       '@types/node':
         specifier: ^22.10.5
         version: 22.20.4
@@ -42,9 +26,18 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^4.1.10
         version: 4.1.11(vitest@4.1.11)
+      ai:
+        specifier: ^7.0.107
+        version: 7.0.111(zod@4.6.5)
+      ink:
+        specifier: ^7.1.1
+        version: 7.1.1(@types/react@19.3.0)(react@19.3.0)
       ink-testing-library:
         specifier: ^4.0.0
         version: 4.0.0(@types/react@19.3.0)
+      react:
+        specifier: ^19.2.8
+        version: 19.3.0
       tsup:
         specifier: ^8.3.5
         version: 8.5.1(postcss@8.5.28)(tsx@4.23.15)(typescript@5.9.3)(yaml@2.9.1)
@@ -57,6 +50,12 @@ importers:
       vitest:
         specifier: ^4.1.10
         version: 4.1.11(@types/node@22.20.4)(@vitest/coverage-v8@4.1.11)(vite@8.3.0(@types/node@22.20.4)(esbuild@0.27.7)(tsx@4.23.15)(yaml@2.9.1))
+      yaml:
+        specifier: ^2.9.1
+        version: 2.9.1
+      zod:
+        specifier: ^4.4.3
+        version: 4.6.5
 
 packages:
 
