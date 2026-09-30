@@ -712,3 +712,39 @@ describe('agent fix loop', () => {
     await expect(main(['fix', sql.id, root, ...sources(), '--verify'])).rejects.toThrow('--fix --json" first');
   });
 });
+
+describe('fixes on branches', () => {
+  const SAFE_LINE = "  const sql = 'SELECT * FROM Users WHERE email = ?';";
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+
+  beforeEach(() => {
+    for (const name of ['AUTHOR', 'COMMITTER']) {
+      vi.stubEnv(`GIT_${name}_NAME`, 't');
+      vi.stubEnv(`GIT_${name}_EMAIL`, 't@t');
+    }
+  });
+
+  it('shows a fix waiting on a branch in a later scan, until it is merged', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    script = [
+      [{ name: 'replace_in_file', args: { path: 'routes/login.js', oldText: QUERY_LINE, newText: SAFE_LINE } }],
+      [{ name: 'submit_fix', args: { outcome: 'fixed', summary: 'Placeholder.', notes: [] } }],
+    ];
+    expect(await main(['fix', sql.id, root, ...sources(), ...model(), '--allow-unverified'])).toBe(0);
+    stdout = '';
+
+    const after = (await scanJson()).findings as unknown as Array<{ id: string; fix: { branch: string; verified: boolean } | null }>;
+    expect(after.find((finding) => finding.id === sql.id)!.fix).toMatchObject({ branch: `minotaur/fix-${sql.id}`, verified: false });
+    expect(after.filter((finding) => finding.id !== sql.id).every((finding) => finding.fix === null)).toBe(true);
+
+    expect(await main(['scan', root, ...sources()])).toBe(0);
+    expect(stdout).toContain('⎇');
+    expect(stdout).toContain(`1 finding has a fix on branch minotaur/fix-${sql.id}, not merged yet`);
+    expect(stdout).toContain(`git merge minotaur/fix-${sql.id}`);
+
+    git('merge', '-q', `minotaur/fix-${sql.id}`);
+    stdout = '';
+    // The report file is unchanged, so the finding is still listed; the fix is merged, so it is no longer pending.
+    expect((await scanJson()).findings.every((finding) => (finding as { fix?: unknown }).fix === null)).toBe(true);
+  });
+});

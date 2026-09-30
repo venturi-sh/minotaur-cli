@@ -137,6 +137,8 @@ export function initialState(options: {
   protectedPaths: ReadonlySet<string>;
   model: ModelStatus;
   results?: ReadonlyMap<string, TriageResult> | undefined;
+  /** Fixes on branches that are not merged yet, by fingerprint. */
+  fixes?: ReadonlyMap<string, FixView> | undefined;
   message?: string | null | undefined;
 }): BrowserState {
   return {
@@ -157,7 +159,7 @@ export function initialState(options: {
     queue: [],
     marking: null,
     fixing: null,
-    fixes: new Map(),
+    fixes: new Map(options.fixes ?? []),
     question: null,
     message: options.message ?? null,
   };
@@ -352,10 +354,15 @@ function startFix(state: BrowserState): Update {
   return { state: { ...state, detailScroll: 0 }, effect: { type: 'fix', findings: [finding] } };
 }
 
+/** The findings F would fix: every one shown that can be fixed here. */
+export function fixableShown(state: BrowserState): readonly LocalFinding[] {
+  return visibleFindings(state).filter((finding) => fixRefusal(finding, state.protectedPaths) === null);
+}
+
 function askToFixShown(state: BrowserState): Update {
   const waiting = busy(state);
   if (waiting) return { state: { ...state, message: waiting } };
-  const findings = visibleFindings(state).filter((finding) => fixRefusal(finding, state.protectedPaths) === null);
+  const findings = fixableShown(state);
   if (findings.length === 0) return { state: { ...state, message: 'No finding shown can be fixed here.' } };
   return { state: { ...state, question: { kind: 'batch', findings } } };
 }

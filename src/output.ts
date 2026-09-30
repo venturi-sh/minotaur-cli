@@ -59,7 +59,8 @@ export function fit(text: string, width: number): string {
   return single.length <= width ? single.padEnd(width) : `${single.slice(0, Math.max(0, width - 1))}…`;
 }
 
-export function renderFindingTable(findings: readonly LocalFinding[], style: Style, width = 120): string {
+/** `onBranch` holds the fingerprints with a fix on a branch that is not merged yet. */
+export function renderFindingTable(findings: readonly LocalFinding[], style: Style, width = 120, onBranch: ReadonlySet<string> = new Set()): string {
   if (findings.length === 0) return 'No findings.';
   const kindWidth = 6;
   const severityWidth = 8;
@@ -80,7 +81,7 @@ export function renderFindingTable(findings: readonly LocalFinding[], style: Sty
   ].join('  ');
   const rows = findings.map((finding) =>
     [
-      isClosed(finding) ? style.dim('✓') : finding.focus === 'likely' ? style.yellow('!') : ' ',
+      onBranch.has(finding.fingerprint) ? style.green('⎇') : isClosed(finding) ? style.dim('✓') : finding.focus === 'likely' ? style.yellow('!') : ' ',
       finding.id,
       style.severity(finding.severity, fit(finding.severity, severityWidth)),
       fit(finding.kind, kindWidth),
@@ -90,8 +91,9 @@ export function renderFindingTable(findings: readonly LocalFinding[], style: Sty
     ].join('  '),
   );
   const legend = [
-    ...(findings.some((finding) => finding.focus === 'likely' && !isClosed(finding)) ? [`${style.yellow('!')} likely an issue`] : []),
-    ...(findings.some(isClosed) ? ['✓ marked false positive, accepted risk or fixed'] : []),
+    ...(findings.some((finding) => finding.focus === 'likely' && !isClosed(finding) && !onBranch.has(finding.fingerprint)) ? [`${style.yellow('!')} likely an issue`] : []),
+    ...(findings.some((finding) => isClosed(finding) && !onBranch.has(finding.fingerprint)) ? ['✓ marked false positive, accepted risk or fixed'] : []),
+    ...(findings.some((finding) => onBranch.has(finding.fingerprint)) ? [`${style.green('⎇')} fixed on a branch, not merged yet`] : []),
   ];
   if (legend.length > 0) return [style.bold(header), ...rows, style.dim(legend.join('   '))].join('\n');
   return [style.bold(header), ...rows].join('\n');
@@ -258,6 +260,11 @@ export const findingsFileSchema = z.object({
           by: z.string(),
           age: z.string(),
         })
+        .nullable()
+        .optional(),
+      /** A fix on a `minotaur/` branch that the scanned commit does not have yet, or null. */
+      fix: z
+        .object({ branch: z.string(), commit: z.string(), by: z.string().nullable(), verified: z.boolean() })
         .nullable()
         .optional(),
     }),

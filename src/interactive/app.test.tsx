@@ -480,6 +480,7 @@ describe('fixing in the browser', () => {
       }),
     );
     await tick();
+    expect(screen()).toContain('F fix all (1)');
     input.write('F');
     await tick();
     expect(screen()).toContain('Fix the 1 finding shown');
@@ -508,6 +509,49 @@ describe('fixing in the browser', () => {
     release({ run: fixRun([fixResult({ status: 'stopped_at_cap', commit: null })], { branch: null, stoppedAtCap: true }), diffs: new Map() });
     await tick();
     expect(screen()).toContain('press F again to continue');
+    input.write('q');
+    await done;
+  });
+});
+
+describe('fixes from an earlier run', () => {
+  it('marks a finding fixed on a branch in the list, and shows the change on its page', async () => {
+    const { input, output, screen } = terminal(120, 40);
+    const done = browse(
+      options({
+        loaded: {
+          fixes: new Map([
+            [
+              finding.fingerprint,
+              {
+                status: 'fixed',
+                branch: 'minotaur/fixes-3f9a1c2',
+                commit: 'abc1234def5678'.padEnd(40, '0'),
+                summary: 'Fixed on branch minotaur/fixes-3f9a1c2 by agent:claude, not merged yet.',
+                notes: [],
+                error: null,
+                diff: '-eval(req.query.code);\n+run(codes[req.query.code]);',
+              },
+            ],
+          ]),
+          message: '1 finding has a fix on branch minotaur/fixes-3f9a1c2, not merged yet; merge it to close it.',
+          results: new Map([[finding.fingerprint, result()]]),
+        },
+        input,
+        output,
+      }),
+    );
+    await tick();
+    // The check and the fix are separate: the row shows both.
+    const row = screen().split('\n').find((line) => line.includes(finding.id))!;
+    expect(row).toContain('▲ exploitable');
+    expect(row).toContain('⎇ minotaur/fixes-3f9a1c2');
+    expect(screen()).toContain('FIX');
+    expect(screen()).toContain('not merged yet; merge it to close it');
+    input.write('\r');
+    await tick();
+    expect(screen()).toContain('by agent:claude');
+    expect(screen()).toContain('+run(codes[req.query.code]);');
     input.write('q');
     await done;
   });

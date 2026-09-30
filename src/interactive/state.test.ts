@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { LocalFinding } from '../sources.js';
 import type { TriageResult } from '../triage.js';
 import {
+  fixableShown,
   handleKey,
   initialState,
   nextCheck,
@@ -13,7 +14,9 @@ import {
   withFindings,
   withViewport,
   type BrowserState,
+  type FixView,
 } from './state.js';
+import { fixLabel } from './content.js';
 
 function finding(id: string, overrides: Partial<LocalFinding> = {}): LocalFinding {
   return {
@@ -221,6 +224,18 @@ describe('details and checks', () => {
   });
 });
 
+describe('fix column', () => {
+  const view = (status: FixView['status'], branch: string | null) => ({ status, branch, commit: branch ? 'c'.repeat(40) : null, summary: null, notes: [], error: null, diff: null });
+  const withFix = (fix: FixView) => state({ fixes: new Map([[findings[0]!.fingerprint, fix]]) });
+
+  it('names the full branch, and marks an unverified fix', () => {
+    expect(fixLabel(withFix(view('fixed', 'minotaur/fixes-3f9a1c2')), findings[0]!).text).toBe('⎇ minotaur/fixes-3f9a1c2');
+    expect(fixLabel(withFix(view('committed_unverified', 'minotaur/fix-aaaa0001')), findings[0]!).text).toBe('⎇ minotaur/fix-aaaa0001 ?');
+    expect(fixLabel(withFix(view('failed', null)), findings[0]!).text).toBe('✗ not fixed');
+    expect(fixLabel(state(), findings[0]!).text).toBe('');
+  });
+});
+
 describe('fix keys', () => {
   const fixing = { total: 1, index: 0, current: 'aaaa0001', steps: 0, costUsd: 0, phase: 'fixing' };
 
@@ -245,6 +260,9 @@ describe('fix keys', () => {
   it('asks before fixing what is shown, leaving out what cannot be fixed, and treats only y as yes', () => {
     const asked = handleKey(state({ showNoise: true }), { sequence: 'F' }, 10).state;
     expect(asked.question).toEqual({ kind: 'batch', findings: findings.slice(0, 3) });
+    // The secret is shown, but it is not counted: F would not fix it.
+    expect(fixableShown(state({ showNoise: true }))).toHaveLength(3);
+    expect(fixableShown(state({ showNoise: true, minSeverity: 'high' }))).toHaveLength(2);
     expect(handleKey(asked, { sequence: 'y' }, 10).effect).toEqual({ type: 'fix', findings: findings.slice(0, 3) });
     expect(handleKey(asked, { name: 'return' }, 10).effect).toBeUndefined();
     const checkpoint = state({ question: { kind: 'checkpoint', spentUsd: 10, capUsd: 10, fixed: 1, notFixed: 0, remaining: 2, current: 'aaaa0002' } });

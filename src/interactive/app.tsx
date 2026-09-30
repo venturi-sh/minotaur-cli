@@ -22,6 +22,7 @@ import {
   ACCENT,
   SEVERITY_COLOR,
   checkLabel,
+  fixLabel,
   detailLines,
   layoutFor,
   markingPrompt,
@@ -37,6 +38,7 @@ import {
   initialState,
   nextCheck,
   hiddenCount,
+  fixableShown,
   selectedFinding,
   withFindings,
   visibleFindings,
@@ -60,6 +62,8 @@ export interface Loaded {
   protectedPaths: ReadonlySet<string>;
   /** Earlier checks that still apply, by fingerprint. */
   results?: ReadonlyMap<string, TriageResult> | undefined;
+  /** Fixes on branches that are not merged yet, by fingerprint. */
+  fixes?: ReadonlyMap<string, FixView> | undefined;
   /** Shown until the first key press, such as where the findings came from. */
   message?: string | null | undefined;
   /** The commit, when it changed since the view opened, such as after a new commit and a rescan. */
@@ -116,7 +120,7 @@ const LIST_KEYS: ReadonlyArray<[string, string]> = [
   ['enter', 'open'],
   ['t', 'check'],
   ['f', 'fix'],
-  ['F', 'fix shown'],
+  ['F', 'fix all'],
   ['s', 'severity'],
   ['m', 'mark'],
   ['a', 'hidden'],
@@ -534,9 +538,15 @@ function toolWidth(findings: readonly LocalFinding[]): number {
   return Math.min(14, Math.max(4, ...findings.map((finding) => toolsOf(finding).length)));
 }
 
+/** As wide as the longest label shown, so a full branch name fits and the title keeps its room when there is none. */
+function fixColumnWidth(state: BrowserState, findings: readonly LocalFinding[]): number {
+  return Math.min(40, Math.max(14, ...findings.map((finding) => fixLabel(state, finding).text.length)));
+}
+
 function FindingList({ state, layout }: { state: BrowserState; layout: Layout }) {
   const findings = visibleFindings(state);
   const tool = toolWidth(findings);
+  const fixWidth = fixColumnWidth(state, findings);
   const rows = findings.slice(state.top, state.top + layout.body);
   // Narrow terminals drop the columns that matter least, so the title keeps some room.
   const wide = layout.inner >= 100;
@@ -550,6 +560,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
         <Cell width={10} text="SEVERITY" dim bold />
         {wide && <Cell width={6} text="KIND" dim bold />}
         <Cell width={17} text="CHECK" dim bold />
+        <Cell width={fixWidth} text="FIX" dim bold />
         {wide && <Cell width={tool} text="TOOL" dim bold />}
         <Cell grow={3} text="TITLE" dim bold />
         {medium && <Cell grow={2} text="LOCATION" dim bold />}
@@ -566,6 +577,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
       {rows.map((finding, index) => {
         const selected = state.top + index === state.cursor;
         const check = checkLabel(state, finding);
+        const fix = fixLabel(state, finding);
         return (
           <Box key={finding.fingerprint} height={1} columnGap={2} {...(selected ? { backgroundColor: '#2d2d44' } : {})}>
             <Box width={1}>
@@ -587,10 +599,19 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
             {wide && <Cell width={6} text={finding.kind} dim={!selected} />}
             <Box width={17} flexShrink={0} overflow="hidden">
               {check.running ? (
-                <Spinner label="checking" />
+                <Spinner label={check.text} />
               ) : (
                 <Text wrap="truncate-end" {...styleProps(check)}>
                   {check.text}
+                </Text>
+              )}
+            </Box>
+            <Box width={fixWidth} flexShrink={0} overflow="hidden">
+              {fix.running ? (
+                <Spinner label={fix.text} />
+              ) : (
+                <Text wrap="truncate-end" {...styleProps(fix)}>
+                  {fix.text}
                 </Text>
               )}
             </Box>
@@ -665,7 +686,8 @@ function DetailLine({ line, width }: { line: Line; width: number }) {
 }
 
 function Footer({ state, layout }: { state: BrowserState; layout: Layout }) {
-  const keys = state.view === 'list' ? LIST_KEYS : DETAIL_KEYS;
+  // The count is what F would fix now, so it follows the filters.
+  const keys = state.view === 'list' ? LIST_KEYS.map(([key, label]): [string, string] => (key === 'F' ? [key, `${label} (${fixableShown(state).length})`] : [key, label])) : DETAIL_KEYS;
   const running = state.running;
   const finding = running ? state.findings.find((item) => item.fingerprint === running.fingerprint) : undefined;
   const total = visibleFindings(state).length;

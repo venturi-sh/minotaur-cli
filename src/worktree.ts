@@ -137,6 +137,42 @@ export async function fixedOnBranch(branch: FixBranch): Promise<Set<string>> {
   return new Set(log.split(/[\0\n]/).map((line) => line.trim()).filter(Boolean));
 }
 
+/** A fix committed on a `minotaur/` branch that the scanned commit does not have yet. */
+export interface PendingFix {
+  branch: string;
+  commit: string;
+  /** The model, package manager or agent that made it, from `Minotaur-Fixed-By`. */
+  by: string | null;
+  /** False when the commit says no scanner could check it. */
+  verified: boolean;
+}
+
+/**
+ * Fixes waiting to be merged, by the fingerprint of each finding they remove.
+ * Read from the `Minotaur-Finding` trailers of the commits on every
+ * `minotaur/` branch that `base` does not contain, so a fix disappears from
+ * here once it is merged. The newest fix of a finding wins.
+ */
+export async function pendingFixes(top: string, base: string): Promise<Map<string, PendingFix>> {
+  const fixes = new Map<string, PendingFix>();
+  const refs = await git(top, ['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', 'refs/heads/minotaur/']);
+  if (refs.code !== 0) return fixes;
+  for (const branch of refs.stdout.split('\n').filter(Boolean)) {
+    const format = '%H%x1f%(trailers:key=Minotaur-Finding,valueonly,separator=%x1d)%x1f%(trailers:key=Minotaur-Fixed-By,valueonly)%x1f%b%x1e';
+    const log = await git(top, ['log', `--format=${format}`, `${base}..${branch}`, '--']);
+    if (log.code !== 0) continue;
+    for (const entry of log.stdout.split('\x1e')) {
+      const [commit, findings = '', by = '', body = ''] = entry.trim().split('\x1f');
+      if (!commit) continue;
+      const fix: PendingFix = { branch, commit, by: by.trim() || null, verified: !body.includes('Not verified:') };
+      for (const fingerprint of findings.split(/[\x1d\n]/).map((item) => item.trim()).filter(Boolean)) {
+        if (!fixes.has(fingerprint)) fixes.set(fingerprint, fix);
+      }
+    }
+  }
+  return fixes;
+}
+
 /** Drops every uncommitted edit, so the next fix starts from the last commit. */
 export async function discardChanges(branch: FixBranch): Promise<void> {
   await must(branch.worktree, ['reset', '-q', '--hard', 'HEAD'], 'could not undo the edits');

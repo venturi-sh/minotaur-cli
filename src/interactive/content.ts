@@ -193,6 +193,32 @@ export const FIX_LABEL: Record<FixView['status'], { text: string; color: string 
   skipped: { text: 'Skipped', color: 'gray' },
 };
 
+/**
+ * The FIX column. Kept apart from the check: a finding can be checked and
+ * fixed, or only one of them, in either order.
+ */
+export function fixLabel(state: BrowserState, finding: LocalFinding): CheckLabel {
+  if (state.fixing?.current === finding.id) return { text: 'fixing', color: ACCENT, running: true };
+  const fix = state.fixes.get(finding.fingerprint);
+  if (!fix) return { text: '' };
+  const branch = fix.branch ?? 'branch';
+  switch (fix.status) {
+    case 'fixed':
+      return { text: `⎇ ${branch}`, color: 'green', bold: true };
+    case 'committed_unverified':
+      return { text: `⎇ ${branch} ?`, color: 'yellow' };
+    case 'unverified':
+      return { text: '? not verified', color: 'yellow' };
+    case 'skipped':
+      return { text: "– can't fix", dim: true };
+    case 'not_tried':
+    case 'stopped_at_cap':
+      return { text: '· not tried', dim: true };
+    default:
+      return { text: '✗ not fixed', color: 'red' };
+  }
+}
+
 /** The outcome, where the commit is, and the patch with its added and removed lines colored. Added to `lines`. */
 function addFix(
   fix: FixView,
