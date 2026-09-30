@@ -14,7 +14,9 @@ import {
   withFindings,
   withViewport,
   type BrowserState,
+  type FixView,
 } from './state.js';
+import { fixLabel } from './content.js';
 
 function finding(id: string, overrides: Partial<LocalFinding> = {}): LocalFinding {
   return {
@@ -219,6 +221,18 @@ describe('details and checks', () => {
   it('clears a message on the next key, and q quits', () => {
     expect(press(state({ message: 'hello' }), 'down').message).toBeNull();
     expect(handleKey(state(), key('q'), 10).effect).toEqual({ type: 'quit' });
+  });
+});
+
+describe('fix column', () => {
+  const view = (status: FixView['status'], branch: string | null) => ({ status, branch, commit: branch ? 'c'.repeat(40) : null, summary: null, notes: [], error: null, diff: null });
+  const withFix = (fix: FixView) => state({ fixes: new Map([[findings[0]!.fingerprint, fix]]) });
+
+  it('names the branch without its minotaur/ prefix, and marks an unverified fix', () => {
+    expect(fixLabel(withFix(view('fixed', 'minotaur/fixes-3f9a1c2')), findings[0]!).text).toBe('⎇ fixes-3f9a1c2');
+    expect(fixLabel(withFix(view('committed_unverified', 'minotaur/fix-aaaa0001')), findings[0]!).text).toBe('⎇ fix-aaaa0001 ?');
+    expect(fixLabel(withFix(view('failed', null)), findings[0]!).text).toBe('✗ not fixed');
+    expect(fixLabel(state(), findings[0]!).text).toBe('');
   });
 });
 
