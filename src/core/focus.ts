@@ -135,28 +135,54 @@ function matchesAny(value: string | undefined, patterns: readonly string[] | und
   return patterns.find((pattern) => globToRegExp(pattern).test(value)) ?? null;
 }
 
-const compiled = new Map<string, RegExp>();
+export type GlobMatcher = { test(value: string): boolean };
+
+const compiled = new Map<string, GlobMatcher>();
 
 /** `**` spans directories, `*` and `?` stay within one. Rule ids have no slashes, so `*` covers any part of one. */
-export function globToRegExp(pattern: string): RegExp {
+export function globToRegExp(pattern: string): GlobMatcher {
   const cached = compiled.get(pattern);
   if (cached) return cached;
-  let source = '';
-  for (let index = 0; index < pattern.length; index++) {
-    const char = pattern[index]!;
-    if (char === '*' && pattern[index + 1] === '*') {
-      const slash = pattern[index + 2] === '/';
-      source += slash ? '(?:.*/)?' : '.*';
-      index += slash ? 2 : 1;
-    } else if (char === '*') {
-      source += '[^/]*';
-    } else if (char === '?') {
-      source += '[^/]';
-    } else {
-      source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  const matcher: GlobMatcher = { test: (value) => globMatch(pattern, 0, value, 0) };
+  compiled.set(pattern, matcher);
+  return matcher;
+}
+
+/** Same shape as the old RegExp conversion, without building a RegExp from the pattern. */
+function globMatch(pattern: string, pi: number, value: string, vi: number): boolean {
+  while (pi < pattern.length) {
+    if (pattern[pi] === '*' && pattern[pi + 1] === '*') {
+      const slash = pattern[pi + 2] === '/';
+      const next = pi + (slash ? 3 : 2);
+      if (slash) {
+        if (globMatch(pattern, next, value, vi)) return true;
+        for (let index = vi; index < value.length; index++) {
+          if (value[index] === '/' && globMatch(pattern, next, value, index + 1)) return true;
+        }
+        return false;
+      }
+      for (let index = vi; index <= value.length; index++) {
+        if (globMatch(pattern, next, value, index)) return true;
+      }
+      return false;
     }
+    if (pattern[pi] === '*') {
+      const next = pi + 1;
+      for (let index = vi; index <= value.length; index++) {
+        if (index > vi && value[index - 1] === '/') break;
+        if (globMatch(pattern, next, value, index)) return true;
+      }
+      return false;
+    }
+    if (pattern[pi] === '?') {
+      if (vi >= value.length || value[vi] === '/') return false;
+      pi += 1;
+      vi += 1;
+      continue;
+    }
+    if (vi >= value.length || value[vi] !== pattern[pi]) return false;
+    pi += 1;
+    vi += 1;
   }
-  const regex = new RegExp(`^${source}$`);
-  compiled.set(pattern, regex);
-  return regex;
+  return vi === value.length;
 }
