@@ -5,6 +5,7 @@
  *   minotaur triage ID [PATH]       decide whether one finding is exploitable
  *   minotaur brief ID [PATH]        the commit, the files to read, and how to answer
  *   minotaur verdict ID [PATH]      store an answer an agent worked out itself
+ *   minotaur fix ID... [PATH]       fix findings on a new branch, checked by a rescan
  *   minotaur mark ID STATE [PATH]   record a person's decision about a finding
  *
  * Results go to stdout and everything else to stderr, so `--json` output can
@@ -29,6 +30,7 @@ import {
   PLAIN,
   readFindingsFile,
   renderFindingTable,
+  renderFixRun,
   renderSourceOutcome,
   renderSummary,
   renderTriageResult,
@@ -76,6 +78,9 @@ import {
 } from './decisions.js';
 import { CommitError, describeCommit, resolveTarget, stillCommitted, targetNotes, treeFor, type Target } from './commit.js';
 import { agentIdentity, buildBrief, reviewVerdict } from './review.js';
+import type { EarlierCheck } from './agent/index.js';
+import { runFixes, type FixEvent } from './fix.js';
+import { branchName, WorktreeError } from './worktree.js';
 
 const VERSION = '0.1.0';
 
@@ -87,6 +92,8 @@ Usage:
   minotaur triage ID [PATH] [options]     Ask a model whether one finding is exploitable
   minotaur brief ID [PATH] [options]      What to read, and how to judge one finding
   minotaur verdict ID [PATH] [options]    Store an answer you worked out yourself
+  minotaur fix ID... [PATH] [options]     Fix findings on a new branch, and check each
+                                          fix by running the scanner again
   minotaur mark ID DECISION [PATH]        Record your own decision about a finding:
                                           false-positive, accepted-risk, fixed, confirmed,
                                           or open to remove it
@@ -154,6 +161,22 @@ verdict:
   --json                 Write the stored answer as JSON
   --findings FILE        Read findings from "scan --json" instead of scanning
 
+fix:
+  Each fix is made in a separate worktree from the commit, and committed on the
+  branch minotaur/fix-ID, or minotaur/fixes-COMMIT for several findings. Your
+  working tree does not change. A fix is committed only when the scanners that
+  reported the finding run again and no longer report it, report nothing as
+  severe in the changed files, and the change does not silence them. A fix that
+  fails gets one more attempt. Code and configuration findings can be fixed now.
+  To give a PATH with several ids, put it last.
+  --force                Replace the branch if it already exists
+  --allow-unverified     Commit a fix even when no scanner can run again to check
+                         it, such as a finding read from a report file
+  --model, --base-url, --effort, --max-steps, --max-usd, --max-tokens
+                         As for triage. The limits apply to each finding.
+  --json                 Write the branch and a result for each finding as JSON
+  --findings FILE        Read findings from "scan --json" instead of scanning
+
 mark:
   --reason TEXT          Why, for the people who review the decision
   --findings FILE        Find the id in "scan --json" output instead of scanning
@@ -192,6 +215,8 @@ const OPTIONS = {
   unchecked: { type: 'boolean' },
   file: { type: 'string' },
   agent: { type: 'string' },
+  force: { type: 'boolean' },
+  'allow-unverified': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'v' },
 } as const;
@@ -247,7 +272,19 @@ export async function main(argv: readonly string[]): Promise<number> {
     if (extra.length > 0) throw new UsageError('verdict takes a finding id and at most one path');
     return verdict(id, await repoRoot(path), values);
   }
-  throw new UsageError(`unknown command "${command}"; expected scan, triage, brief, verdict or mark`);
+  if (command === 'fix') {
+    if (rest.length === 0) throw new UsageError('fix needs at least one finding id; run "minotaur scan" to list them');
+    const { ids, path } = await idsAndPath(rest);
+    return fix(ids, await repoRoot(path), values);
+  }
+  throw new UsageError(`unknown command "${command}"; expected scan, triage, brief, verdict, fix or mark`);
+}
+
+/** Several ids, then maybe a path. The last word is the path when it names a directory. */
+async function idsAndPath(words: readonly string[]): Promise<{ ids: string[]; path: string | undefined }> {
+  const last = words.at(-1)!;
+  const isDirectory = words.length > 1 && ((await stat(fromInvocation(last)).catch(() => null))?.isDirectory() ?? false);
+  return isDirectory ? { ids: words.slice(0, -1), path: last } : { ids: [...words], path: undefined };
 }
 
 /** Where the command was typed. Package scripts run from the package, and record the real place in INIT_CWD. */
@@ -576,8 +613,8 @@ function configuredIdentity(config: Config, values: Values): CheckIdentity | nul
   }
 }
 
-/** The finding, the tree to read, and the files a check must not open. */
-async function openFinding(id: string, root: string, values: Values) {
+/** The findings, the tree to read, and the files a check must not open. */
+async function openFindings(ids: readonly string[], root: string, values: Values) {
   const { config } = await loadConfig(root);
   const file = values.findings ? await readFindingsFile(fromInvocation(values.findings)) : null;
   // Findings from "scan --json" belong to the commit they were scanned on.
@@ -590,7 +627,14 @@ async function openFinding(id: string, root: string, values: Values) {
   // Decisions may have changed since a findings file was written, so they are read again.
   const findings = file ? applyDecisions(file.findings, await loadDecisions(root)) : gathered.findings;
   const protectedPaths = liftProtected([...(file ? file.protectedPaths : gathered.protectedPaths), ...secretPaths(findings)], findings);
-  return { config, where, tree: gathered.tree, protectedPaths, finding: resolveFinding(findings, id) };
+  const picked = [...new Map(ids.map((id) => resolveFinding(findings, id)).map((finding) => [finding.fingerprint, finding])).values()];
+  return { config, where, tree: gathered.tree, protectedPaths, findings: picked, scanned: findings };
+}
+
+/** The finding, the tree to read, and the files a check must not open. */
+async function openFinding(id: string, root: string, values: Values) {
+  const { findings, ...opened } = await openFindings([id], root, values);
+  return { ...opened, finding: findings[0]! };
 }
 
 async function triage(id: string, root: string, values: Values): Promise<number> {
@@ -753,6 +797,80 @@ async function verdict(id: string, root: string, values: Values): Promise<number
   }
   await saveCheck(checkCacheDir(cacheDir()), scopeOf(opened.where), reviewed.result, [], by);
   return writeTriageResult(reviewed.result, values);
+}
+
+/** `minotaur fix ID...`: fix findings on a new branch, one commit each. */
+async function fix(ids: readonly string[], root: string, values: Values): Promise<number> {
+  const { config } = await loadConfig(root);
+  const model = resolveModel(modelFlags(values), config, process.env);
+  const limits = triageLimits(values, config);
+  const opened = await openFindings(ids, root, values);
+  const { where, findings } = opened;
+  const sources = await sourcesFor(where, opened.tree, values, config);
+  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), opened.tree, findings, identityOf(model), opened.protectedPaths);
+  const earlier = new Map<string, EarlierCheck>();
+  for (const finding of findings) {
+    const check = checks.get(finding.fingerprint)?.result;
+    if (check?.status === 'succeeded' && check.exploitability && check.rationale) earlier.set(finding.fingerprint, earlierFrom(check, finding, 'the earlier check'));
+  }
+  const branch = branchName(findings.map((finding) => finding.id), where.commit.short);
+
+  info(`\nFixing ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} on branch ${branch}, from ${describeCommit(where.commit)}.`);
+  info(`Code is sent to ${describeModel(model)}.`);
+  info(`Limits for each finding: ${describeLimits(model, limits)}.`);
+
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  process.once('SIGINT', stop);
+  try {
+    const run = await runFixes({
+      target: where,
+      findings,
+      scanned: opened.scanned,
+      protectedPaths: opened.protectedPaths,
+      model,
+      limits,
+      sources,
+      includeIgnored: values['include-ignored'] ?? false,
+      branch,
+      cache: cacheDir(),
+      force: values.force ?? false,
+      allowUnverified: values['allow-unverified'] ?? false,
+      earlier,
+      managed: { onDownload: info },
+      abortSignal: controller.signal,
+      onEvent: fixReporter(),
+    });
+    if (values.json) process.stdout.write(`${JSON.stringify({ base: where.commit.sha, ...run }, null, 2)}\n`);
+    else process.stdout.write(`\n${renderFixRun(run, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN)}\n`);
+    return run.results.every((result) => result.commit !== null) && !run.interrupted ? 0 : 1;
+  } catch (error) {
+    if (error instanceof WorktreeError) throw new UsageError(error.message);
+    throw error;
+  } finally {
+    process.removeListener('SIGINT', stop);
+  }
+}
+
+/** Progress of a fix run as plain lines on stderr. */
+function fixReporter(): (event: FixEvent) => void {
+  return (event) => {
+    if (event.type === 'start') {
+      const count = event.total > 1 ? ` (${event.index + 1} of ${event.total})` : '';
+      info(`\n${event.finding.id}${count}: ${event.finding.title}`);
+    } else if (event.type === 'step') {
+      const { progress } = event;
+      const tokens = (progress.inputTokens + progress.outputTokens).toLocaleString('en-US');
+      const cost = progress.costUsd > 0 ? `, $${progress.costUsd.toFixed(2)}` : '';
+      const edited = progress.changedFiles.length > 0 ? `, edited ${progress.changedFiles.join(', ')}` : '';
+      info(`  step ${progress.steps} of at most ${event.maxSteps}: ${tokens} tokens so far${cost}${edited}`);
+    } else if (event.type === 'verify') {
+      info(event.scanners.length > 0 ? `  running ${event.scanners.join(', ')} again` : '  no scanner can run again to check this fix');
+    } else if (event.type === 'retry') {
+      info('  not fixed yet, trying again:');
+      for (const problem of event.problems) info(`    ${problem}`);
+    }
+  };
 }
 
 async function readStdin(): Promise<string> {

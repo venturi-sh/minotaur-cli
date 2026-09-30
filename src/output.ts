@@ -10,6 +10,7 @@ import { z } from 'zod';
 
 import { decisionSchema, isClosed } from './decisions.js';
 import type { LocalFinding, SourceOutcome } from './sources.js';
+import type { FixRun, FixStatus } from './fix.js';
 import { refusalFor, type TriageResult } from './triage.js';
 
 export interface Style {
@@ -168,6 +169,51 @@ export function usageLine(result: Pick<TriageResult, 'steps' | 'inputTokens' | '
   const tokens = `${result.inputTokens.toLocaleString('en-US')} input and ${result.outputTokens.toLocaleString('en-US')} output tokens`;
   const cost = result.costUsd > 0 ? `, $${result.costUsd.toFixed(2)}` : '';
   return `${result.steps} step${result.steps === 1 ? '' : 's'}, ${tokens}${cost}, ${result.model}`;
+}
+
+const FIX_LABEL: Record<FixStatus, string> = {
+  fixed: 'Fixed',
+  committed_unverified: 'Committed, not verified',
+  unverified: 'Not committed, no scanner could verify it',
+  failed: 'Not fixed',
+  gave_up: 'Gave up',
+  stopped_at_limit: 'Stopped at the limit',
+  skipped: 'Skipped',
+};
+
+/** The result of `minotaur fix`: what happened to each finding, and where the commits are. */
+export function renderFixRun(run: FixRun, base: string, style: Style): string {
+  const committed = run.results.filter((result) => result.commit !== null);
+  const lines: string[] = [];
+  for (const result of run.results) {
+    const finding = result.finding;
+    const label = FIX_LABEL[result.status];
+    const colored = result.status === 'fixed' ? style.green(label) : result.commit ? style.yellow(label) : style.red(label);
+    lines.push(
+      `${style.bold(finding.id)}  ${style.severity(finding.severity as Severity, finding.severity)}  ${finding.title}${finding.location ? `  ${style.dim(locationOf(finding))}` : ''}`,
+      `  ${colored}${result.commit ? ` in ${result.commit.slice(0, 7)}` : ''}${result.attempts > 1 ? style.dim(` after ${result.attempts} attempts`) : ''}`,
+    );
+    if (result.summary) lines.push(...indent(result.summary).map((line) => (line ? `  ${line}` : line)));
+    if (result.error) lines.push(`    ${style.dim(result.error)}`);
+    if (result.notes.length > 0 && result.commit) lines.push(`    ${style.bold('For the reviewer')}`, ...result.notes.map((note) => `      - ${note}`));
+    if (result.steps > 0) lines.push(`    ${style.dim(usageLine(result))}`);
+    lines.push('');
+  }
+
+  const total = run.results.length;
+  const cost = run.results.reduce((sum, result) => sum + result.costUsd, 0);
+  const done = `${committed.length} of ${total} finding${total === 1 ? '' : 's'} committed${cost > 0 ? `, $${cost.toFixed(2)}` : ''}`;
+  if (run.branch) {
+    lines.push(
+      `${style.bold(done)} on branch ${style.bold(run.branch)}.`,
+      style.dim(`Review: git log -p ${base.slice(0, 7)}..${run.branch}`),
+      style.dim(`Merge:  git merge ${run.branch}`),
+    );
+  } else {
+    lines.push(`${style.bold(done)}. No branch was kept.`);
+  }
+  if (run.interrupted) lines.push(style.yellow('Stopped with Ctrl-C before every finding was tried.'));
+  return lines.join('\n');
 }
 
 function ageOf(ms: number): string {

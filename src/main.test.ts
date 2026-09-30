@@ -536,3 +536,59 @@ describe('minotaur triage', () => {
     expect(await readFile(join(root, 'routes', 'login.js'), 'utf8')).toContain(QUERY_LINE);
   });
 });
+
+describe('minotaur fix', () => {
+  const SAFE_LINE = "  const sql = 'SELECT * FROM Users WHERE email = ?';";
+  const fixCalls = (): ToolCall[][] => [
+    [{ name: 'read_file', args: { path: 'routes/login.js' } }],
+    [{ name: 'replace_in_file', args: { path: 'routes/login.js', oldText: QUERY_LINE, newText: SAFE_LINE } }],
+    [{ name: 'submit_fix', args: { outcome: 'fixed', summary: 'Used a placeholder for the email.', notes: [] } }],
+  ];
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+
+  beforeEach(() => {
+    for (const name of ['AUTHOR', 'COMMITTER']) {
+      vi.stubEnv(`GIT_${name}_NAME`, 't');
+      vi.stubEnv(`GIT_${name}_EMAIL`, 't@t');
+    }
+  });
+
+  it('does not commit a fix that no scanner can check, and keeps no branch', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    script = fixCalls();
+    expect(await main(['fix', sql.id, root, ...sources(), ...model()])).toBe(1);
+    expect(stdout).toContain('Not committed, no scanner could verify it');
+    expect(stdout).toContain('No branch was kept');
+    expect(git('branch', '--list', 'minotaur/*')).toBe('');
+  });
+
+  it('commits on a new branch with --allow-unverified, and leaves the working tree alone', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    script = fixCalls();
+    expect(await main(['fix', sql.id, root, ...sources(), ...model(), '--allow-unverified', '--json'])).toBe(0);
+    const run = JSON.parse(stdout);
+    expect(run.branch).toBe(`minotaur/fix-${sql.id}`);
+    expect(run.results[0]).toMatchObject({ status: 'committed_unverified', changedFiles: ['routes/login.js'] });
+    expect(git('show', `${run.branch}:routes/login.js`)).toContain(SAFE_LINE);
+    expect(await readFile(join(root, 'routes', 'login.js'), 'utf8')).toContain(QUERY_LINE);
+    expect(stderr).toContain(`on branch minotaur/fix-${sql.id}`);
+  });
+
+  it('skips a secret without calling the model, and takes several ids', async () => {
+    const found = (await scanJson()).findings;
+    const secret = found.find((finding) => finding.kind === 'secret')!;
+    const sql = found.find((finding) => finding.kind === 'sast')!;
+    script = fixCalls();
+    expect(await main(['fix', secret.id, sql.id, root, ...sources(), ...model(), '--allow-unverified', '--json'])).toBe(1);
+    const run = JSON.parse(stdout);
+    expect(run.branch).toMatch(/^minotaur\/fixes-/);
+    expect(run.results.map((result: { status: string }) => result.status)).toEqual(['skipped', 'committed_unverified']);
+    expect(JSON.stringify(requests)).not.toContain(SECRET);
+  });
+
+  it('refuses a branch that exists', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    git('branch', `minotaur/fix-${sql.id}`);
+    await expect(main(['fix', sql.id, root, ...sources(), ...model()])).rejects.toThrow('already exists');
+  });
+});

@@ -198,3 +198,71 @@ describe('Workspace.unchanged', () => {
     expect(await ws.unchanged([])).toBe(false);
   });
 });
+
+describe('Workspace writes', () => {
+  const writable = { writable: { readOnly: ['.minotaur.yml', '.minotaur/'] } };
+
+  it('refuses every write when not opened writable', async () => {
+    const ws = await Workspace.open(root);
+    await expect(ws.writeFile('src/new.js', 'x')).rejects.toThrow('read-only');
+    await expect(ws.replaceInFile('src/app.js', 'ok', 'fine')).rejects.toThrow('read-only');
+  });
+
+  it('replaces text that occurs once and records the file', async () => {
+    const ws = await Workspace.open(root, writable);
+    expect(await ws.replaceInFile('src/app.js', '_.template(input);', '_.escape(input);')).toEqual({ path: 'src/app.js', line: 2 });
+    expect((await ws.readFile('src/app.js')).content).toContain('2: _.escape(input);');
+    expect(ws.changedFiles()).toEqual(['src/app.js']);
+  });
+
+  it('asks for more context when the text is missing or repeated', async () => {
+    await writeFile(join(root, 'src/twice.js'), 'a();\na();\n');
+    const ws = await Workspace.open(root, writable);
+    await expect(ws.replaceInFile('src/twice.js', 'a();', 'b();')).rejects.toThrow('occurs 2 times');
+    await expect(ws.replaceInFile('src/app.js', 'missing', 'b')).rejects.toThrow('does not occur');
+    expect(ws.changedFiles()).toEqual([]);
+  });
+
+  it('creates new files and their directories', async () => {
+    const ws = await Workspace.open(root, writable);
+    await ws.writeFile('src/lib/escape.js', 'export const escape = (s) => s;\n');
+    expect((await ws.readFile('src/lib/escape.js')).content).toContain('export const escape');
+    expect(ws.changedFiles()).toEqual(['src/lib/escape.js']);
+  });
+
+  it.each([
+    ['.env', 'credentials'],
+    ['.git/config', 'ignore file'],
+    ['.semgrepignore', 'ignore file'],
+    ['sub/.trivyignore', 'ignore file'],
+    ['.minotaur.yml', 'configuration'],
+    ['.minotaur/decisions.yml', 'configuration'],
+    ['../escape.js', 'outside'],
+  ])('refuses to write %s', async (path, reason) => {
+    const ws = await Workspace.open(root, writable);
+    const write = ws.writeFile(path, 'x');
+    await expect(write).rejects.toBeInstanceOf(WorkspaceAccessError);
+    await expect(ws.writeFile(path, 'x')).rejects.toThrow(reason);
+  });
+
+  it('refuses a path given as absolute', async () => {
+    const ws = await Workspace.open(root, writable);
+    await expect(ws.writeFile(join(root, 'src/app.js'), 'x')).rejects.toThrow('relative');
+  });
+
+  it('does not follow a symlinked directory out of the repository or around the rules', async () => {
+    await symlink(outside, join(root, 'out'));
+    await mkdir(join(root, '.minotaur'));
+    await symlink(join(root, '.minotaur'), join(root, 'docs'));
+    const ws = await Workspace.open(root, writable);
+    await expect(ws.writeFile('out/pwned.txt', 'x')).rejects.toThrow('outside');
+    await expect(ws.writeFile('docs/decisions.yml', 'x')).rejects.toThrow('configuration');
+  });
+
+  it('does not write through a symlinked file', async () => {
+    await symlink(join(outside, 'secret.txt'), join(root, 'link.txt'));
+    const ws = await Workspace.open(root, writable);
+    await expect(ws.writeFile('link.txt', 'x')).rejects.toThrow('symbolic link');
+    await expect(ws.replaceInFile('link.txt', 'outside', 'x')).rejects.toThrow('symbolic link');
+  });
+});

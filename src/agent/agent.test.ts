@@ -6,7 +6,8 @@ import type { ModelMessage } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { triageFinding, withCacheBreakpoints } from './agent.js';
+import { triageFinding } from './agent.js';
+import { withCacheBreakpoints } from './loop.js';
 import { SpendBudget } from './budget.js';
 import type { TriageSubject } from './prompt.js';
 import { Workspace } from './workspace.js';

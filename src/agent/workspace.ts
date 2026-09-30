@@ -1,5 +1,6 @@
 /**
- * Read-only access to a scanned repository, for the triage agent.
+ * Access to a scanned repository, for the agents. Read-only unless opened
+ * writable, which only the fix agent does, on a worktree of its own.
  *
  * Everything the agent can see goes through here, which makes this the
  * boundary that matters: the repository is untrusted input, the paths come
@@ -13,8 +14,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readdir, readFile, realpath, stat } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { isSensitiveFile, type AssessmentInput } from '../core/index.js';
 
@@ -71,6 +72,30 @@ function namesSkippedDir(pathContains: string | undefined): boolean {
   return pathContains.split('/').some((segment) => SKIPPED_DIRS.has(segment) || segment === 'site-packages');
 }
 
+/**
+ * Files a fix may never write. A scanner's ignore file would make a finding
+ * disappear without fixing anything, and so would git's own files.
+ */
+const NEVER_WRITTEN = new Set([
+  '.git',
+  '.semgrepignore',
+  '.opengrepignore',
+  '.trivyignore',
+  '.trivyignore.yaml',
+  '.checkov.yml',
+  '.checkov.yaml',
+  '.gitleaksignore',
+  '.secretlintignore',
+]);
+
+export interface WritableOptions {
+  /**
+   * Repository-relative paths that stay read-only, in addition to the built-in
+   * ones. A path ending in `/` covers everything under it.
+   */
+  readOnly?: readonly string[];
+}
+
 export { isSensitiveFile };
 
 export class WorkspaceAccessError extends Error {}
@@ -89,12 +114,14 @@ export interface GrepOptions {
 
 export class Workspace {
   private readonly observed = new Map<string, string>();
+  private readonly written = new Set<string>();
   private readonly denied: ReadonlySet<string>;
 
   private constructor(
     readonly root: string,
     private readonly limits: WorkspaceLimits,
     denied: readonly string[],
+    private readonly writable: WritableOptions | null,
   ) {
     this.denied = new Set(denied.map((path) => normalizeRelative(path)));
   }
@@ -102,12 +129,48 @@ export class Workspace {
   /**
    * `denied` lists repository-relative paths to refuse in addition to the
    * built-in sensitive files, typically every path a secret finding points at.
+   * Without `writable`, every write is refused.
    */
   static async open(
     root: string,
-    options: { limits?: Partial<WorkspaceLimits>; denied?: readonly string[] } = {},
+    options: { limits?: Partial<WorkspaceLimits>; denied?: readonly string[]; writable?: WritableOptions } = {},
   ): Promise<Workspace> {
-    return new Workspace(await realpath(root), { ...DEFAULT_LIMITS, ...options.limits }, options.denied ?? []);
+    return new Workspace(await realpath(root), { ...DEFAULT_LIMITS, ...options.limits }, options.denied ?? [], options.writable ?? null);
+  }
+
+  /** Files written so far, repository-relative and sorted. */
+  changedFiles(): string[] {
+    return [...this.written].sort();
+  }
+
+  /** Writes a whole file, creating it and its directories when missing. */
+  async writeFile(path: string, content: string): Promise<{ path: string; lines: number }> {
+    const { absolute, rel } = await this.resolveWrite(path);
+    if (Buffer.byteLength(content) > this.limits.maxFileBytes) throw new WorkspaceAccessError(`too large to write: ${path}`);
+    await mkdir(dirname(absolute), { recursive: true });
+    await writeFile(absolute, content, 'utf8');
+    this.written.add(rel);
+    return { path: rel, lines: content.split('\n').length };
+  }
+
+  /**
+   * Replaces one exact piece of text. It must occur once, so the edit lands
+   * where the model meant it to and nowhere else.
+   */
+  async replaceInFile(path: string, oldText: string, newText: string): Promise<{ path: string; line: number }> {
+    if (oldText.length === 0) throw new WorkspaceAccessError('oldText is empty; use write_file to create a file');
+    const { absolute, rel } = await this.resolveWrite(path);
+    const text = await this.readText(absolute).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') throw new WorkspaceAccessError(`no such file: ${path}`);
+      throw error;
+    });
+    const at = text.indexOf(oldText);
+    if (at < 0) throw new WorkspaceAccessError(`oldText does not occur in ${rel}; read the file again and copy the text exactly`);
+    const count = text.split(oldText).length - 1;
+    if (count > 1) throw new WorkspaceAccessError(`oldText occurs ${count} times in ${rel}; include more of the surrounding lines`);
+    await writeFile(absolute, text.slice(0, at) + newText + text.slice(at + oldText.length), 'utf8');
+    this.written.add(rel);
+    return { path: rel, line: text.slice(0, at).split('\n').length };
   }
 
   /** Everything read or searched so far, for caching. */
@@ -276,6 +339,44 @@ export class Workspace {
     if (this.isDenied(rel)) throw new WorkspaceAccessError(`refused, may contain credentials: ${path}`);
     if (info.size > this.limits.maxFileBytes) throw new WorkspaceAccessError(`too large to read: ${path}`);
     return { absolute, rel };
+  }
+
+  /**
+   * Where a write goes, which may not exist yet. The nearest existing
+   * directory is resolved through `realpath`, so a symlinked directory cannot
+   * lead out of the root, and an existing symlink is never written through.
+   */
+  private async resolveWrite(path: string): Promise<{ absolute: string; rel: string }> {
+    if (!this.writable) throw new WorkspaceAccessError('this workspace is read-only');
+    if (isAbsolute(path)) throw new WorkspaceAccessError('paths must be relative to the repository root');
+    const lexical = normalizeRelative(relative(this.root, resolve(this.root, path)));
+    this.refuseWrite(lexical, path);
+
+    let parent = dirname(join(this.root, lexical));
+    while (!(await lstat(parent).catch(() => null))) parent = dirname(parent);
+    const realParent = await realpath(parent);
+    if (realParent !== this.root && !realParent.startsWith(this.root + sep)) throw new WorkspaceAccessError(`outside the repository: ${path}`);
+    const absolute = join(realParent, relative(parent, join(this.root, lexical)));
+    // A symlinked directory inside the root can still rename the path, so the rules apply to where it lands too.
+    const rel = normalizeRelative(relative(this.root, absolute));
+    this.refuseWrite(rel, path);
+
+    const existing = await lstat(absolute).catch(() => null);
+    if (existing?.isSymbolicLink()) throw new WorkspaceAccessError(`refused: ${path} is a symbolic link`);
+    if (existing?.isDirectory()) throw new WorkspaceAccessError(`is a directory: ${path}`);
+    return { absolute, rel };
+  }
+
+  private refuseWrite(rel: string, path: string): void {
+    if (rel === '' || rel === '..' || rel.startsWith('../')) throw new WorkspaceAccessError(`outside the repository: ${path}`);
+    if (rel.split('/').some((segment) => NEVER_WRITTEN.has(segment))) {
+      throw new WorkspaceAccessError(`refused: ${path} is a git or scanner ignore file, which a fix may not change`);
+    }
+    const readOnly = this.writable?.readOnly ?? [];
+    if (readOnly.some((entry) => (entry.endsWith('/') ? rel.startsWith(entry) : rel === entry))) {
+      throw new WorkspaceAccessError(`refused: ${path} is Minotaur's own configuration, which a fix may not change`);
+    }
+    if (this.isDenied(rel)) throw new WorkspaceAccessError(`refused, may contain credentials: ${path}`);
   }
 
   private isDenied(rel: string): boolean {
