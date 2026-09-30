@@ -545,7 +545,7 @@ describe('fixes from an earlier run', () => {
     // The check and the fix are separate: the row shows both.
     const row = screen().split('\n').find((line) => line.includes(finding.id))!;
     expect(row).toContain('▲ exploitable');
-    expect(row).toContain('⎇ fixes-3f9a1c2');
+    expect(row).toContain('⎇ minotaur/fixes-3f9a1c2');
     expect(screen()).toContain('FIX');
     expect(screen()).toContain('not merged yet; merge it to close it');
     input.write('\r');

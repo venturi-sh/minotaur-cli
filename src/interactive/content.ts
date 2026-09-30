@@ -201,8 +201,7 @@ export function fixLabel(state: BrowserState, finding: LocalFinding): CheckLabel
   if (state.fixing?.current === finding.id) return { text: 'fixing', color: ACCENT, running: true };
   const fix = state.fixes.get(finding.fingerprint);
   if (!fix) return { text: '' };
-  // Every fix branch is under minotaur/, so the column shows the rest; the finding's page has the full name.
-  const branch = fix.branch?.replace(/^minotaur\//, '') ?? 'branch';
+  const branch = fix.branch ?? 'branch';
   switch (fix.status) {
     case 'fixed':
       return { text: `⎇ ${branch}`, color: 'green', bold: true };

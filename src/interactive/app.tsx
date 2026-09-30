@@ -538,12 +538,15 @@ function toolWidth(findings: readonly LocalFinding[]): number {
   return Math.min(14, Math.max(4, ...findings.map((finding) => toolsOf(finding).length)));
 }
 
-/** Room for "⎇ fixes-" and a short commit hash, with a "?" when the fix is unverified. */
-const FIX_WIDTH = 18;
+/** As wide as the longest label shown, so a full branch name fits and the title keeps its room when there is none. */
+function fixColumnWidth(state: BrowserState, findings: readonly LocalFinding[]): number {
+  return Math.min(40, Math.max(14, ...findings.map((finding) => fixLabel(state, finding).text.length)));
+}
 
 function FindingList({ state, layout }: { state: BrowserState; layout: Layout }) {
   const findings = visibleFindings(state);
   const tool = toolWidth(findings);
+  const fixWidth = fixColumnWidth(state, findings);
   const rows = findings.slice(state.top, state.top + layout.body);
   // Narrow terminals drop the columns that matter least, so the title keeps some room.
   const wide = layout.inner >= 100;
@@ -557,7 +560,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
         <Cell width={10} text="SEVERITY" dim bold />
         {wide && <Cell width={6} text="KIND" dim bold />}
         <Cell width={17} text="CHECK" dim bold />
-        <Cell width={FIX_WIDTH} text="FIX" dim bold />
+        <Cell width={fixWidth} text="FIX" dim bold />
         {wide && <Cell width={tool} text="TOOL" dim bold />}
         <Cell grow={3} text="TITLE" dim bold />
         {medium && <Cell grow={2} text="LOCATION" dim bold />}
@@ -603,7 +606,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
                 </Text>
               )}
             </Box>
-            <Box width={FIX_WIDTH} flexShrink={0} overflow="hidden">
+            <Box width={fixWidth} flexShrink={0} overflow="hidden">
               {fix.running ? (
                 <Spinner label={fix.text} />
               ) : (
