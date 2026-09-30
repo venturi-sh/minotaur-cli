@@ -354,10 +354,15 @@ function startFix(state: BrowserState): Update {
   return { state: { ...state, detailScroll: 0 }, effect: { type: 'fix', findings: [finding] } };
 }
 
+/** The findings F would fix: every one shown that can be fixed here. */
+export function fixableShown(state: BrowserState): readonly LocalFinding[] {
+  return visibleFindings(state).filter((finding) => fixRefusal(finding, state.protectedPaths) === null);
+}
+
 function askToFixShown(state: BrowserState): Update {
   const waiting = busy(state);
   if (waiting) return { state: { ...state, message: waiting } };
-  const findings = visibleFindings(state).filter((finding) => fixRefusal(finding, state.protectedPaths) === null);
+  const findings = fixableShown(state);
   if (findings.length === 0) return { state: { ...state, message: 'No finding shown can be fixed here.' } };
   return { state: { ...state, question: { kind: 'batch', findings } } };
 }

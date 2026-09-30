@@ -28,7 +28,7 @@ pnpm minotaur fix 3f9a1c2e                      # fix it on the branch minotaur/
 pnpm minotaur fix --all                         # fix everything scan lists, one commit each
 ```
 
-In the browser, press `t` to check a finding, `f` to fix it, `F` to fix all findings shown, `m`
+In the browser, press `t` to check a finding, `f` to fix it, `F` to fix all findings shown (the footer shows how many), `m`
 to mark it, `a` to show hidden findings, `r` to scan again and `q` to quit. The footer lists the
 other keys.
 

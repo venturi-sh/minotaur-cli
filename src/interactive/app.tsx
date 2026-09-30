@@ -37,6 +37,7 @@ import {
   initialState,
   nextCheck,
   hiddenCount,
+  fixableShown,
   selectedFinding,
   withFindings,
   visibleFindings,
@@ -118,7 +119,7 @@ const LIST_KEYS: ReadonlyArray<[string, string]> = [
   ['enter', 'open'],
   ['t', 'check'],
   ['f', 'fix'],
-  ['F', 'fix shown'],
+  ['F', 'fix all'],
   ['s', 'severity'],
   ['m', 'mark'],
   ['a', 'hidden'],
@@ -667,7 +668,8 @@ function DetailLine({ line, width }: { line: Line; width: number }) {
 }
 
 function Footer({ state, layout }: { state: BrowserState; layout: Layout }) {
-  const keys = state.view === 'list' ? LIST_KEYS : DETAIL_KEYS;
+  // The count is what F would fix now, so it follows the filters.
+  const keys = state.view === 'list' ? LIST_KEYS.map(([key, label]): [string, string] => (key === 'F' ? [key, `${label} (${fixableShown(state).length})`] : [key, label])) : DETAIL_KEYS;
   const running = state.running;
   const finding = running ? state.findings.find((item) => item.fingerprint === running.fingerprint) : undefined;
   const total = visibleFindings(state).length;

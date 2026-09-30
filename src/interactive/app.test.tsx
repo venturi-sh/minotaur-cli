@@ -480,6 +480,7 @@ describe('fixing in the browser', () => {
       }),
     );
     await tick();
+    expect(screen()).toContain('F fix all (1)');
     input.write('F');
     await tick();
     expect(screen()).toContain('Fix the 1 finding shown');

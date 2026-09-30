@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { LocalFinding } from '../sources.js';
 import type { TriageResult } from '../triage.js';
 import {
+  fixableShown,
   handleKey,
   initialState,
   nextCheck,
@@ -245,6 +246,9 @@ describe('fix keys', () => {
   it('asks before fixing what is shown, leaving out what cannot be fixed, and treats only y as yes', () => {
     const asked = handleKey(state({ showNoise: true }), { sequence: 'F' }, 10).state;
     expect(asked.question).toEqual({ kind: 'batch', findings: findings.slice(0, 3) });
+    // The secret is shown, but it is not counted: F would not fix it.
+    expect(fixableShown(state({ showNoise: true }))).toHaveLength(3);
+    expect(fixableShown(state({ showNoise: true, minSeverity: 'high' }))).toHaveLength(2);
     expect(handleKey(asked, { sequence: 'y' }, 10).effect).toEqual({ type: 'fix', findings: findings.slice(0, 3) });
     expect(handleKey(asked, { name: 'return' }, 10).effect).toBeUndefined();
     const checkpoint = state({ question: { kind: 'checkpoint', spentUsd: 10, capUsd: 10, fixed: 1, notFixed: 0, remaining: 2, current: 'aaaa0002' } });
