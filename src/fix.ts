@@ -506,7 +506,7 @@ async function upgradeWithTool(
     if (error instanceof UpgradeError) return { done: true, status: 'failed', extra: { error: error.message } };
     throw error;
   }
-  const verdict = await verifyAndCommit(finding, state, options, progress, { summary: progress.summary, notes: progress.notes, outcome: 'fixed' });
+  const verdict = await verifyAndCommit(finding, contextOf(state, options), progress, { summary: progress.summary, notes: progress.notes, outcome: 'fixed' });
   return { done: true, ...verdict };
 }
 
@@ -570,7 +570,7 @@ async function fixWithModel(
       }
     }
 
-    const verdict = await verifyAndCommit(finding, state, options, progress, attempt.submission!);
+    const verdict = await verifyAndCommit(finding, contextOf(state, options), progress, attempt.submission!);
     if (verdict.status !== 'failed' || verdict.extra.commit || attempts >= MAX_ATTEMPTS || !session.canRetry() || options.abortSignal?.aborted) {
       return finish(verdict.status, { ...counted, ...verdict.extra });
     }
@@ -593,15 +593,66 @@ async function checkpoint(finding: LocalFinding, state: RunState, options: RunFi
   return go;
 }
 
+/** What checking and committing a change needs, whoever made it. */
+interface VerifyContext {
+  branch: FixBranch;
+  baseline: Baseline;
+  rescan: Rescan;
+  options: Pick<RunFixesOptions, 'sources' | 'allowUnverified' | 'onEvent'>;
+}
+
+function contextOf(state: RunState, options: RunFixesOptions): VerifyContext {
+  return { branch: state.branch, baseline: state.baseline, rescan: state.rescan, options };
+}
+
+/**
+ * `fix ID --verify`: checks what an agent changed in the worktree from
+ * `brief --fix`, and commits it when it passes. The worktree is removed once
+ * the fix is committed, and kept with the edits when it is not, so the agent
+ * can try again.
+ */
+export async function verifyAgentFix(options: {
+  branch: FixBranch;
+  finding: LocalFinding;
+  scanned: readonly LocalFinding[];
+  sources: readonly SourceConfig[];
+  includeIgnored: boolean;
+  allowUnverified: boolean;
+  /** Recorded as who fixed it, such as `agent:cursor`. */
+  by: string;
+  summary: string;
+  managed?: EnsureOptions;
+  onEvent?: (event: FixEvent) => void;
+  rescan?: Rescan;
+}): Promise<FixResult> {
+  const started = Date.now();
+  const rescan: Rescan =
+    options.rescan ??
+    ((tree, sources) => collectFindings(tree, sources, { includeIgnored: options.includeIgnored, managed: options.managed ?? {} }));
+  const context: VerifyContext = { branch: options.branch, baseline: new Baseline(options.scanned), rescan, options };
+  const progress = { changedFiles: [] as string[], verification: null as Verification | null, model: options.by };
+  const verdict = await verifyAndCommit(options.finding, context, progress, { outcome: 'fixed', summary: options.summary, notes: [] });
+  if (verdict.extra.commit) await closeFixBranch(options.branch);
+  return {
+    ...resultBase(options.finding, options.by, options.branch.name),
+    status: verdict.status,
+    summary: options.summary,
+    changedFiles: progress.changedFiles,
+    verification: progress.verification,
+    attempts: 1,
+    durationMs: Date.now() - started,
+    ...verdict.extra,
+  };
+}
+
 /** Rescans the change and commits it when it passes. Leaves the edits in place when it does not. */
 async function verifyAndCommit(
   finding: LocalFinding,
-  state: RunState,
-  options: RunFixesOptions,
-  progress: Progress,
+  context: VerifyContext,
+  progress: Pick<Progress, 'changedFiles' | 'verification' | 'model'>,
   submission: FixSubmission,
 ): Promise<{ status: FixStatus; extra: Partial<FixResult> }> {
-  const { branch, baseline } = state;
+  const { branch, baseline, options } = context;
   const changed = await changedPaths(branch);
   progress.changedFiles = changed;
   if (changed.length === 0) {
@@ -613,7 +664,7 @@ async function verifyAndCommit(
   const sources = rescanSources(finding, options.sources);
   const diff = await uncommittedDiff(branch, changed);
   options.onEvent?.({ type: 'verify', finding, scanners: sources.map((source) => ('scanner' in source ? source.scanner : source.report)) });
-  const checked = await verifyFix({ finding, tree: branch.tree, sources, changedFiles: changed, diff, baseline, rescan: state.rescan });
+  const checked = await verifyFix({ finding, tree: branch.tree, sources, changedFiles: changed, diff, baseline, rescan: context.rescan });
   const verification = checked.verification;
   progress.verification = verification;
 

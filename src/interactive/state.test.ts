@@ -220,3 +220,35 @@ describe('details and checks', () => {
     expect(handleKey(state(), key('q'), 10).effect).toEqual({ type: 'quit' });
   });
 });
+
+describe('fix keys', () => {
+  const fixing = { total: 1, index: 0, current: 'aaaa0001', steps: 0, costUsd: 0, phase: 'fixing' };
+
+  it('fixes the selected finding, and refuses a secret with the reason', () => {
+    expect(handleKey(state(), { sequence: 'f' }, 10).effect).toEqual({ type: 'fix', findings: [findings[0]] });
+    const secret = handleKey(state({ showNoise: true, cursor: 3 }), { sequence: 'f' }, 10);
+    expect(secret.effect).toBeUndefined();
+    expect(secret.state.message).toContain('rotate it');
+  });
+
+  it('runs one job at a time', () => {
+    const running = { fingerprint: findings[1]!.fingerprint, steps: 1, maxSteps: 30, tokens: 0, costUsd: 0, filesRead: [] };
+    expect(handleKey(state({ running }), { sequence: 'f' }, 10).state.message).toContain('A check is running');
+    expect(handleKey(state({ fixing }), { sequence: 't' }, 10).state.message).toContain('A fix is running');
+    expect(handleKey(state({ fixing }), { sequence: 'r' }, 10).effect).toBeUndefined();
+  });
+
+  it('stops a fix with Ctrl+C instead of quitting', () => {
+    expect(handleKey(state({ fixing }), { name: 'c', ctrl: true }, 10).effect).toEqual({ type: 'cancel' });
+  });
+
+  it('asks before fixing what is shown, leaving out what cannot be fixed, and treats only y as yes', () => {
+    const asked = handleKey(state({ showNoise: true }), { sequence: 'F' }, 10).state;
+    expect(asked.question).toEqual({ kind: 'batch', findings: findings.slice(0, 3) });
+    expect(handleKey(asked, { sequence: 'y' }, 10).effect).toEqual({ type: 'fix', findings: findings.slice(0, 3) });
+    expect(handleKey(asked, { name: 'return' }, 10).effect).toBeUndefined();
+    const checkpoint = state({ question: { kind: 'checkpoint', spentUsd: 10, capUsd: 10, fixed: 1, notFixed: 0, remaining: 2, current: 'aaaa0002' } });
+    expect(handleKey(checkpoint, { name: 'c', ctrl: true }, 10).effect).toEqual({ type: 'answer', go: false });
+    expect(handleKey(checkpoint, { sequence: 'y' }, 10).effect).toEqual({ type: 'answer', go: true });
+  });
+});

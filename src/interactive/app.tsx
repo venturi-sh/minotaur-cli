@@ -16,6 +16,7 @@ import type { StepProgress } from '../agent/index.js';
 import { CLOSED_STATES, DECISION_LABEL, type DecisionState } from '../decisions.js';
 import { locationOf, toolsOf } from '../output.js';
 import type { LocalFinding } from '../sources.js';
+import type { Checkpoint, FixEvent, FixRun } from '../fix.js';
 import type { TriageResult } from '../triage.js';
 import {
   ACCENT,
@@ -24,6 +25,7 @@ import {
   detailLines,
   layoutFor,
   markingPrompt,
+  questionPrompt,
   severityCounts,
   type Layout,
   type Line,
@@ -40,6 +42,7 @@ import {
   visibleFindings,
   withViewport,
   type BrowserState,
+  type FixView,
   type Key,
   type ModelStatus,
 } from './state.js';
@@ -63,6 +66,19 @@ export interface Loaded {
   commit?: string | null | undefined;
 }
 
+export interface FixOptions {
+  onEvent: (event: FixEvent) => void;
+  /** Resolves true to go on past the batch's cap. */
+  onCheckpoint: (checkpoint: Checkpoint) => Promise<boolean>;
+  signal: AbortSignal;
+}
+
+/** A finished fix run, with each commit's patch by fingerprint. */
+export interface Fixed {
+  run: FixRun;
+  diffs: ReadonlyMap<string, string>;
+}
+
 export interface Decided {
   findings: readonly LocalFinding[];
   protectedPaths: ReadonlySet<string>;
@@ -81,6 +97,8 @@ export interface BrowseOptions {
   check: (finding: LocalFinding, options: CheckOptions) => Promise<TriageResult>;
   /** Records a decision and returns the findings and protected files as they are after it. */
   decide: (finding: LocalFinding, state: DecisionState | 'open', reason: string) => Promise<Decided>;
+  /** Fixes findings on a branch, one commit each. */
+  fix: (findings: readonly LocalFinding[], options: FixOptions) => Promise<Fixed>;
   input: NodeJS.ReadableStream & { isTTY?: boolean; setRawMode?: (raw: boolean) => unknown };
   output: NodeJS.WritableStream & { columns?: number; rows?: number };
 }
@@ -97,6 +115,8 @@ const LIST_KEYS: ReadonlyArray<[string, string]> = [
   ['↑↓', 'move'],
   ['enter', 'open'],
   ['t', 'check'],
+  ['f', 'fix'],
+  ['F', 'fix shown'],
   ['s', 'severity'],
   ['m', 'mark'],
   ['a', 'hidden'],
@@ -108,6 +128,7 @@ const DETAIL_KEYS: ReadonlyArray<[string, string]> = [
   ['[ ]', 'prev/next'],
   ['t', 'check'],
   ['d', 'dig deeper'],
+  ['f', 'fix'],
   ['m', 'mark'],
   ['esc', 'back'],
   ['q', 'quit'],
@@ -237,6 +258,85 @@ function Browser({
   };
 
   const quitting = useRef(false);
+  const fixController = useRef<AbortController | null>(null);
+  // Set while the batch waits at its checkpoint for the person's answer.
+  const answer = useRef<((go: boolean) => void) | null>(null);
+
+  const reply = (go: boolean) => {
+    const resolve = answer.current;
+    answer.current = null;
+    resolve?.(go);
+  };
+
+  /** Runs a fix of one or several findings in the background, and shows each outcome on the finding's page. */
+  const runFix = (state: BrowserState, findings: readonly LocalFinding[]) => {
+    const total = findings.length;
+    update(() => ({ ...state, fixing: { total, index: 0, current: null, steps: 0, costUsd: 0, phase: 'making a worktree' } }));
+    const mine = new AbortController();
+    fixController.current = mine;
+    const onEvent = (event: FixEvent) =>
+      update((state) => {
+        const fixing = state.fixing;
+        if (!fixing) return state;
+        switch (event.type) {
+          case 'start':
+            return { ...state, fixing: { ...fixing, index: event.index, current: event.finding.id, steps: 0, costUsd: 0, phase: 'fixing' } };
+          case 'step':
+            return { ...state, fixing: { ...fixing, steps: event.progress.steps, costUsd: event.progress.costUsd, phase: 'fixing' } };
+          case 'upgrade':
+            return { ...state, fixing: { ...fixing, phase: event.description } };
+          case 'verify':
+            return { ...state, fixing: { ...fixing, phase: event.scanners.length > 0 ? `running ${event.scanners.join(', ')} again` : 'checking' } };
+          case 'retry':
+            return { ...state, fixing: { ...fixing, phase: 'not fixed yet, trying again' } };
+          default:
+            return state;
+        }
+      });
+    const onCheckpoint = (checkpoint: Checkpoint) =>
+      new Promise<boolean>((resolve) => {
+        if (mine.signal.aborted) return resolve(false);
+        answer.current = resolve;
+        const fixed = checkpoint.results.filter((result) => result.commit !== null).length;
+        update((state) => ({
+          ...state,
+          question: {
+            kind: 'checkpoint',
+            spentUsd: checkpoint.spentUsd,
+            capUsd: checkpoint.capUsd,
+            fixed,
+            notFixed: checkpoint.results.length - fixed,
+            remaining: checkpoint.remaining,
+            current: checkpoint.current.id,
+          },
+        }));
+      });
+    const settle = (change: (state: BrowserState) => Partial<BrowserState>) => {
+      if (fixController.current === mine) fixController.current = null;
+      reply(false);
+      update((state) => ({ ...state, ...change(state), fixing: null, question: state.question?.kind === 'checkpoint' ? null : state.question }));
+    };
+    options.fix(findings, { onEvent, onCheckpoint, signal: mine.signal }).then(
+      ({ run, diffs }) =>
+        settle((state) => {
+          const fixes = new Map(state.fixes);
+          for (const result of run.results) {
+            const view: FixView = {
+              status: result.status,
+              branch: result.commit ? run.branch : null,
+              commit: result.commit,
+              summary: result.summary,
+              notes: result.notes,
+              error: result.error,
+              diff: diffs.get(result.finding.fingerprint) ?? null,
+            };
+            fixes.set(result.finding.fingerprint, view);
+          }
+          return { fixes, message: fixMessage(run, total) };
+        }),
+      (error: Error) => settle(() => ({ message: `The fix failed: ${error.message}` })),
+    );
+  };
 
   /** Marks the check as running in `state`, starts it, and runs the next queued one when it settles. */
   const run = (state: BrowserState, finding: LocalFinding, continueFrom: TriageResult | undefined) => {
@@ -292,6 +392,8 @@ function Browser({
       if (effect?.type === 'quit') {
         quitting.current = true;
         controller.current?.abort();
+        fixController.current?.abort();
+        reply(false);
         onQuit([...next.results.values()]);
         exit();
         return;
@@ -309,7 +411,20 @@ function Browser({
         );
         return;
       }
-      if (effect?.type === 'cancel') controller.current?.abort();
+      if (effect?.type === 'cancel') {
+        controller.current?.abort();
+        fixController.current?.abort();
+        reply(false);
+      }
+      if (effect?.type === 'answer') {
+        update(() => next);
+        reply(effect.go);
+        return;
+      }
+      if (effect?.type === 'fix') {
+        runFix(next, effect.findings);
+        return;
+      }
       if (effect?.type === 'triage') {
         run(next, effect.finding, effect.continueFrom);
         return;
@@ -318,6 +433,7 @@ function Browser({
     } catch (error) {
       quitting.current = true;
       controller.current?.abort();
+      fixController.current?.abort();
       exit(error instanceof Error ? error : new Error(String(error)));
     }
   });
@@ -336,6 +452,18 @@ function Browser({
       <Footer state={shown} layout={layout} />
     </Box>
   );
+}
+
+function fixMessage(run: FixRun, total: number): string {
+  const committed = run.results.filter((result) => result.commit !== null).length;
+  const stopped = run.stoppedAtCap ? ' Stopped at the cap; press F again to continue the branch.' : run.interrupted ? ' Stopped with Ctrl+C.' : '';
+  if (total === 1 && run.results.length === 1) {
+    const result = run.results[0]!;
+    if (result.commit) return `${result.finding.id} is fixed on branch ${run.branch}. Open it to see the change.${stopped}`;
+    return `${result.finding.id} is not fixed: ${result.error ?? result.status.replace(/_/g, ' ')}.${stopped}`;
+  }
+  const already = run.alreadyOnBranch > 0 ? ` ${run.alreadyOnBranch} were already on it.` : '';
+  return `${committed} of ${run.results.length} fixed${run.branch ? ` on branch ${run.branch}` : ''}.${already}${stopped}`;
 }
 
 function decidedMessage(finding: LocalFinding, decision: DecisionState | 'open', decided: Decided): string {
@@ -543,6 +671,19 @@ function Footer({ state, layout }: { state: BrowserState; layout: Layout }) {
   const total = visibleFindings(state).length;
   const detailLength = state.view === 'detail' ? detailLines(state, layout.inner).length : 0;
   const more = state.view === 'detail' && state.detailScroll + layout.body < detailLength;
+  if (state.question) {
+    return (
+      <Box height={1} paddingX={1} overflow="hidden">
+        <Text wrap="truncate-start">
+          {questionPrompt(state.question).map((segment, index) => (
+            <Text key={index} bold={segment.bold ?? false} dimColor={segment.dim ?? false} {...(segment.color ? { color: segment.color } : {})}>
+              {segment.text}
+            </Text>
+          ))}
+        </Text>
+      </Box>
+    );
+  }
   if (state.marking) {
     return (
       <Box height={1} paddingX={1} overflow="hidden">
@@ -572,7 +713,11 @@ function Footer({ state, layout }: { state: BrowserState; layout: Layout }) {
       </Box>
       <Spacer />
       <Box flexShrink={0} marginLeft={1}>
-        {running ? (
+        {state.fixing ? (
+          <Spinner
+            label={`fixing ${state.fixing.current ?? ''}${state.fixing.total > 1 ? ` (${state.fixing.index + 1} of ${state.fixing.total})` : ''} · ${state.fixing.phase}`}
+          />
+        ) : running ? (
           <Spinner
             label={`checking ${finding?.id ?? ''} · step ${running.steps}/${running.maxSteps}${state.queue.length > 0 ? ` · ${state.queue.length} queued` : ''}`}
           />

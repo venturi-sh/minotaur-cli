@@ -647,3 +647,68 @@ describe('minotaur fix --all', () => {
     await expect(main(['fix'])).rejects.toThrow('or --all');
   });
 });
+
+describe('agent fix loop', () => {
+  const SAFE_LINE = "  const sql = 'SELECT * FROM Users WHERE email = ?';";
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+
+  beforeEach(() => {
+    for (const name of ['AUTHOR', 'COMMITTER']) {
+      vi.stubEnv(`GIT_${name}_NAME`, 't');
+      vi.stubEnv(`GIT_${name}_EMAIL`, 't@t');
+    }
+  });
+
+  async function briefFix(id: string): Promise<{ tree: string; branch: string; verify: string; finding: string; notes: string[]; instructions: string }> {
+    stdout = '';
+    expect(await main(['brief', id, root, ...sources(), '--fix', '--json'])).toBe(0);
+    const parsed = JSON.parse(stdout);
+    stdout = '';
+    return parsed;
+  }
+
+  it('gives a worktree, keeps the edits across briefs, and commits what passes', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    const first = await briefFix(sql.id);
+    expect(first.branch).toBe(`minotaur/fix-${sql.id}`);
+    expect(first.instructions).toContain('Do not commit');
+    expect(first.verify).toContain('--verify');
+    const file = join(first.tree, 'routes', 'login.js');
+    await writeFile(file, (await readFile(file, 'utf8')).replace(QUERY_LINE, SAFE_LINE));
+    expect((await briefFix(sql.id)).tree).toBe(first.tree);
+    expect(await readFile(file, 'utf8')).toContain(SAFE_LINE);
+
+    // Report files cannot run again, so the fix is only committed when that is allowed.
+    expect(await main(['fix', sql.id, root, ...sources(), '--verify', '--json'])).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({ status: 'unverified', tree: first.tree });
+    stdout = '';
+    expect(await main(['fix', sql.id, root, ...sources(), '--verify', '--allow-unverified', '--agent', 'test', '--message', 'Placeholder for the email.', '--json'])).toBe(0);
+    expect(JSON.parse(stdout)).toMatchObject({ status: 'committed_unverified', model: 'agent:test', changedFiles: ['routes/login.js'], tree: null });
+    const message = git('log', '-1', '--format=%B', first.branch);
+    expect(message).toContain('Placeholder for the email.');
+    expect(message).toContain('Minotaur-Fixed-By: agent:test');
+    expect(git('worktree', 'list')).not.toContain('worktrees');
+    expect(await readFile(join(root, 'routes', 'login.js'), 'utf8')).toContain(QUERY_LINE);
+  });
+
+  it('keeps a secret out of the brief and says to rotate it', async () => {
+    const secret = (await scanJson()).findings.find((finding) => finding.kind === 'secret')!;
+    const brief = await briefFix(secret.id);
+    expect(JSON.stringify(brief)).not.toContain(SECRET);
+    expect(brief.finding).toContain('Do not print, copy, log or repeat');
+    expect(brief.notes.join(' ')).toContain('rotate it');
+  });
+
+  it('discards the worktree and the empty branch', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    await briefFix(sql.id);
+    expect(await main(['fix', sql.id, root, ...sources(), '--discard'])).toBe(0);
+    expect(stdout).toContain('Removed the worktree and branch');
+    expect(git('branch', '--list', 'minotaur/*')).toBe('');
+  });
+
+  it('asks for a brief before verifying', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    await expect(main(['fix', sql.id, root, ...sources(), '--verify'])).rejects.toThrow('--fix --json" first');
+  });
+});

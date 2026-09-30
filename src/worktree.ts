@@ -9,8 +9,8 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, realpath, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
 import type { Target } from './commit.js';
 
@@ -61,8 +61,8 @@ export async function openFixBranch(
   } else if (!options.force && exists) {
     throw new WorktreeError(`branch ${name} already exists; pass --resume to continue it, or --force to replace it`);
   }
-  const worktrees = join(cache, 'worktrees', createHash('sha256').update(top).digest('hex').slice(0, 16));
-  const worktree = join(worktrees, name.replace(/[^A-Za-z0-9._-]/g, '_'));
+  const worktree = worktreeDir(top, name, cache);
+  const worktrees = dirname(worktree);
   // Left over from a run that was killed: git still lists it, and a branch checked out there cannot be moved.
   await git(top, ['worktree', 'remove', '--force', worktree]);
   await rm(worktree, { recursive: true, force: true });
@@ -71,6 +71,33 @@ export async function openFixBranch(
   const add = options.resume ? ['worktree', 'add', '-q', worktree, name] : ['worktree', 'add', '-q', options.force ? '-B' : '-b', name, worktree, target.commit.sha];
   await must(top, add, `could not ${options.resume ? 'check out' : 'make'} branch ${name}`);
   return { name, base: target.commit.sha, worktree, tree: join(worktree, target.prefix), top };
+}
+
+/** Where a branch's worktree is kept in the cache. */
+export function worktreeDir(top: string, name: string, cache: string): string {
+  return join(cache, 'worktrees', createHash('sha256').update(top).digest('hex').slice(0, 16), name.replace(/[^A-Za-z0-9._-]/g, '_'));
+}
+
+/**
+ * The worktree an agent is editing, left open between commands. Null when
+ * there is none, such as before `brief --fix` or after the fix was committed.
+ */
+export async function existingFixBranch(target: Target, name: string, cache: string): Promise<FixBranch | null> {
+  const worktree = worktreeDir(target.top, name, cache);
+  const real = await realpath(worktree).catch(() => null);
+  if (!real) return null;
+  const listed = (await git(target.top, ['worktree', 'list', '--porcelain'])).stdout.split('\n');
+  const paths = await Promise.all(listed.filter((line) => line.startsWith('worktree ')).map((line) => realpath(line.slice(9)).catch(() => '')));
+  if (!paths.includes(real)) return null;
+  if ((await git(target.top, ['merge-base', '--is-ancestor', target.commit.sha, name])).code !== 0) {
+    throw new WorktreeError(`branch ${name} does not start from ${target.commit.short}; pass the commit it started from with --commit`);
+  }
+  return { name, base: target.commit.sha, worktree, tree: join(worktree, target.prefix), top: target.top };
+}
+
+/** A commit's patch, for showing a fix. */
+export async function commitDiff(top: string, commit: string): Promise<string> {
+  return must(top, ['show', '--no-color', '--no-ext-diff', '--format=', commit], 'could not show the fix');
 }
 
 /** Commits exactly these files, as the person's git identity, with their hooks. Returns the new commit. */
