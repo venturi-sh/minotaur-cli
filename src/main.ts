@@ -79,10 +79,13 @@ import {
 import { CommitError, describeCommit, resolveTarget, stillCommitted, targetNotes, treeFor, type Target } from './commit.js';
 import { agentIdentity, buildBrief, reviewVerdict } from './review.js';
 import type { EarlierCheck } from './agent/index.js';
-import { runFixes, type FixEvent } from './fix.js';
+import { runFixes, type Checkpoint, type FixEvent, type FixResult } from './fix.js';
 import { branchName, WorktreeError } from './worktree.js';
 
 const VERSION = '0.1.0';
+
+/** What a run of several fixes may spend before Minotaur asks whether to go on. */
+const DEFAULT_MAX_TOTAL_USD = 10;
 
 const HELP = `minotaur ${VERSION}
 
@@ -93,7 +96,7 @@ Usage:
   minotaur brief ID [PATH] [options]      What to read, and how to judge one finding
   minotaur verdict ID [PATH] [options]    Store an answer you worked out yourself
   minotaur fix ID... [PATH] [options]     Fix findings on a new branch, and check each
-                                          fix by running the scanner again
+  minotaur fix --all [PATH] [options]     fix by running the scanner again
   minotaur mark ID DECISION [PATH]        Record your own decision about a finding:
                                           false-positive, accepted-risk, fixed, confirmed,
                                           or open to remove it
@@ -167,8 +170,21 @@ fix:
   working tree does not change. A fix is committed only when the scanners that
   reported the finding run again and no longer report it, report nothing as
   severe in the changed files, and the change does not silence them. A fix that
-  fails gets one more attempt. Code and configuration findings can be fixed now.
+  fails gets one more attempt.
+  Code and configuration are fixed by the model. A dependency with a known fixed
+  version is upgraded by npm, pnpm, go, cargo, or in a pinned requirements file,
+  without a model; the model changes the manifest when that is not possible, and
+  the package manager then updates the lockfile. Secrets are never fixed.
   To give a PATH with several ids, put it last.
+  --all                  Fix every open finding "scan" lists: --focus (default
+                         maybe) and --min-severity choose which. Findings marked
+                         false positive, accepted risk or fixed are left out.
+  --max-total-usd N      Spend for the whole run before Minotaur asks whether to go
+                         on (default ${DEFAULT_MAX_TOTAL_USD} for several findings). Each "yes" allows N
+                         more. Without a terminal to ask, the run stops, with exit
+                         code 3; --resume continues it.
+  --resume               Continue the branch of an earlier run, skipping the
+                         findings it already has a commit for
   --force                Replace the branch if it already exists
   --allow-unverified     Commit a fix even when no scanner can run again to check
                          it, such as a finding read from a report file
@@ -216,6 +232,8 @@ const OPTIONS = {
   file: { type: 'string' },
   agent: { type: 'string' },
   force: { type: 'boolean' },
+  resume: { type: 'boolean' },
+  'max-total-usd': { type: 'string' },
   'allow-unverified': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'v' },
@@ -273,7 +291,12 @@ export async function main(argv: readonly string[]): Promise<number> {
     return verdict(id, await repoRoot(path), values);
   }
   if (command === 'fix') {
-    if (rest.length === 0) throw new UsageError('fix needs at least one finding id; run "minotaur scan" to list them');
+    if (values.resume && values.force) throw new UsageError('--resume continues the branch and --force replaces it; use one');
+    if (values.all) {
+      if (rest.length > 1) throw new UsageError('fix --all takes at most one path, and no finding ids');
+      return fix(null, await repoRoot(rest[0]), values);
+    }
+    if (rest.length === 0) throw new UsageError('fix needs finding ids, or --all; run "minotaur scan" to list them');
     const { ids, path } = await idsAndPath(rest);
     return fix(ids, await repoRoot(path), values);
   }
@@ -614,7 +637,7 @@ function configuredIdentity(config: Config, values: Values): CheckIdentity | nul
 }
 
 /** The findings, the tree to read, and the files a check must not open. */
-async function openFindings(ids: readonly string[], root: string, values: Values) {
+async function openFindings(ids: readonly string[] | null, root: string, values: Values) {
   const { config } = await loadConfig(root);
   const file = values.findings ? await readFindingsFile(fromInvocation(values.findings)) : null;
   // Findings from "scan --json" belong to the commit they were scanned on.
@@ -627,8 +650,23 @@ async function openFindings(ids: readonly string[], root: string, values: Values
   // Decisions may have changed since a findings file was written, so they are read again.
   const findings = file ? applyDecisions(file.findings, await loadDecisions(root)) : gathered.findings;
   const protectedPaths = liftProtected([...(file ? file.protectedPaths : gathered.protectedPaths), ...secretPaths(findings)], findings);
-  const picked = [...new Map(ids.map((id) => resolveFinding(findings, id)).map((finding) => [finding.fingerprint, finding])).values()];
+  const picked = ids
+    ? [...new Map(ids.map((id) => resolveFinding(findings, id)).map((finding) => [finding.fingerprint, finding])).values()]
+    : openAndInFocus(findings, values);
   return { config, where, tree: gathered.tree, protectedPaths, findings: picked, scanned: findings };
+}
+
+/** What `scan` lists by default, or with the same --focus and --min-severity: for `fix --all`. */
+function openAndInFocus(findings: readonly LocalFinding[], values: Values): LocalFinding[] {
+  const minimum = parseSeverity(values['min-severity']);
+  // For fix, --all means every finding, not every focus level as it does for scan.
+  const floor = parseFocus(values.focus, false) ?? 'maybe';
+  return findings.filter(
+    (finding) =>
+      !isClosed(finding) &&
+      focusRank(finding.focus ?? 'maybe') >= focusRank(floor) &&
+      (!minimum || severityRank(finding.severity) >= severityRank(minimum)),
+  );
 }
 
 /** The finding, the tree to read, and the files a check must not open. */
@@ -799,29 +837,48 @@ async function verdict(id: string, root: string, values: Values): Promise<number
   return writeTriageResult(reviewed.result, values);
 }
 
-/** `minotaur fix ID...`: fix findings on a new branch, one commit each. */
-async function fix(ids: readonly string[], root: string, values: Values): Promise<number> {
+/** `minotaur fix ID...` or `minotaur fix --all`: fix findings on a new branch, one commit each. */
+async function fix(ids: readonly string[] | null, root: string, values: Values): Promise<number> {
   const { config } = await loadConfig(root);
-  const model = resolveModel(modelFlags(values), config, process.env);
+  // Package manager upgrades need no model, so a missing one only fails the fixes that do.
+  let model: ResolvedModel | null = null;
+  let noModel: string | undefined;
+  try {
+    model = resolveModel(modelFlags(values), config, process.env);
+  } catch (error) {
+    noModel = (error as Error).message;
+  }
   const limits = triageLimits(values, config);
   const opened = await openFindings(ids, root, values);
   const { where, findings } = opened;
+  if (findings.length === 0) {
+    process.stdout.write(values.json ? `${JSON.stringify({ base: where.commit.sha, branch: null, results: [] }, null, 2)}\n` : 'Nothing to fix.\n');
+    return 0;
+  }
   const sources = await sourcesFor(where, opened.tree, values, config);
-  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), opened.tree, findings, identityOf(model), opened.protectedPaths);
+  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), opened.tree, findings, model ? identityOf(model) : null, opened.protectedPaths);
   const earlier = new Map<string, EarlierCheck>();
   for (const finding of findings) {
     const check = checks.get(finding.fingerprint)?.result;
     if (check?.status === 'succeeded' && check.exploitability && check.rationale) earlier.set(finding.fingerprint, earlierFrom(check, finding, 'the earlier check'));
   }
-  const branch = branchName(findings.map((finding) => finding.id), where.commit.short);
+  // --all always gets the batch branch, so --resume finds it even when fewer findings are left.
+  const branch = ids ? branchName(findings.map((finding) => finding.id), where.commit.short) : branchName([], where.commit.short);
+  const maxTotalUsd = positiveNumber(values['max-total-usd'], '--max-total-usd') ?? (findings.length > 1 ? DEFAULT_MAX_TOTAL_USD : undefined);
+  const resume = ['minotaur', 'fix', ...(ids ?? ['--all']), root, '--commit', where.commit.sha, '--resume'].join(' ');
 
-  info(`\nFixing ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} on branch ${branch}, from ${describeCommit(where.commit)}.`);
-  info(`Code is sent to ${describeModel(model)}.`);
-  info(`Limits for each finding: ${describeLimits(model, limits)}.`);
+  info(`\n${values.resume ? 'Continuing' : 'Fixing'} ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} on branch ${branch}, from ${describeCommit(where.commit)}.`);
+  if (model) {
+    info(`Code is sent to ${describeModel(model)}.`);
+    info(`Limits for each finding: ${describeLimits(model, limits)}.${maxTotalUsd ? ` Minotaur asks before the run spends more than $${maxTotalUsd}.` : ''}`);
+  } else {
+    info('No model is configured, so only dependencies with a known fixed version can be upgraded.');
+  }
 
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGINT', stop);
+  const canAsk = !values.json && process.stdin.isTTY && process.stderr.isTTY;
   try {
     const run = await runFixes({
       target: where,
@@ -829,26 +886,57 @@ async function fix(ids: readonly string[], root: string, values: Values): Promis
       scanned: opened.scanned,
       protectedPaths: opened.protectedPaths,
       model,
+      noModel,
       limits,
+      maxTotalUsd,
+      onCheckpoint: canAsk ? (checkpoint) => askToContinue(checkpoint, maxTotalUsd!, controller.signal) : undefined,
       sources,
       includeIgnored: values['include-ignored'] ?? false,
       branch,
       cache: cacheDir(),
       force: values.force ?? false,
+      resume: values.resume ?? false,
       allowUnverified: values['allow-unverified'] ?? false,
       earlier,
       managed: { onDownload: info },
       abortSignal: controller.signal,
       onEvent: fixReporter(),
     });
-    if (values.json) process.stdout.write(`${JSON.stringify({ base: where.commit.sha, ...run }, null, 2)}\n`);
-    else process.stdout.write(`\n${renderFixRun(run, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN)}\n`);
-    return run.results.every((result) => result.commit !== null) && !run.interrupted ? 0 : 1;
+    const unfinished = run.stoppedAtCap || run.interrupted;
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify({ base: where.commit.sha, ...run, resume: unfinished ? resume : null }, null, 2)}\n`);
+    } else {
+      process.stdout.write(`\n${renderFixRun(run, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN, unfinished ? resume : null)}\n`);
+    }
+    if (run.stoppedAtCap) return 3;
+    // With --all, what cannot be fixed here, such as a secret, is expected; with named ids it is a failure.
+    const done = (result: FixResult) => result.commit !== null || (!ids && result.status === 'skipped');
+    return run.results.every(done) && !run.interrupted ? 0 : 1;
   } catch (error) {
     if (error instanceof WorktreeError) throw new UsageError(error.message);
     throw error;
   } finally {
     process.removeListener('SIGINT', stop);
+  }
+}
+
+/** The checkpoint at the batch's cap, as a question on the terminal. Ctrl-C, or anything but yes, stops. */
+async function askToContinue(checkpoint: Checkpoint, cap: number, signal: AbortSignal): Promise<boolean> {
+  const count = (statuses: readonly string[]) => checkpoint.results.filter((result) => statuses.includes(result.status)).length;
+  const fixed = count(['fixed', 'committed_unverified']);
+  const notFixed = checkpoint.results.length - fixed;
+  info(`\nThe run has spent $${checkpoint.spentUsd.toFixed(2)} of $${checkpoint.capUsd.toFixed(2)}.`);
+  info(`  ${fixed} fixed, ${notFixed} not fixed, ${checkpoint.remaining} not started.`);
+  info(`  In progress: ${checkpoint.current.id} ${checkpoint.current.title}`);
+  const { createInterface } = await import('node:readline/promises');
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await prompt.question(`Continue for up to $${cap.toFixed(2)} more? [y/N] `, { signal });
+    return /^y(es)?$/i.test(answer.trim());
+  } catch {
+    return false;
+  } finally {
+    prompt.close();
   }
 }
 
@@ -864,6 +952,10 @@ function fixReporter(): (event: FixEvent) => void {
       const cost = progress.costUsd > 0 ? `, $${progress.costUsd.toFixed(2)}` : '';
       const edited = progress.changedFiles.length > 0 ? `, edited ${progress.changedFiles.join(', ')}` : '';
       info(`  step ${progress.steps} of at most ${event.maxSteps}: ${tokens} tokens so far${cost}${edited}`);
+    } else if (event.type === 'upgrade') {
+      info(`  ${event.description}`);
+    } else if (event.type === 'resumed') {
+      if (event.alreadyOnBranch > 0) info(`${event.alreadyOnBranch} already fixed on the branch.`);
     } else if (event.type === 'verify') {
       info(event.scanners.length > 0 ? `  running ${event.scanners.join(', ')} again` : '  no scanner can run again to check this fix');
     } else if (event.type === 'retry') {

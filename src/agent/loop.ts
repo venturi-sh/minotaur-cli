@@ -9,6 +9,11 @@
  * One loop can run more than once. The counters and the prompt-cache marks
  * carry over, so a follow-up turn, such as "your fix did not pass, try
  * again", shares the step limit and the budget with the first one.
+ *
+ * A second budget, `pauseAt`, is shared by several loops, such as every fix
+ * in a batch. When it runs out the loop pauses instead of finishing: the
+ * conversation is kept, and `run` with the same messages picks it up once a
+ * person has raised the cap.
  */
 
 import {
@@ -36,6 +41,8 @@ export interface LoopOptions {
   model: LanguageModel;
   pricing: ModelPricing;
   budget: SpendBudget;
+  /** A shared cap that pauses the loop instead of ending it. */
+  pauseAt?: SpendBudget | undefined;
   maxSteps: number;
   allowance: StepAllowance;
   abortSignal?: AbortSignal | undefined;
@@ -72,7 +79,8 @@ export interface LoopRequest {
 }
 
 export interface LoopOutcome extends LoopUsage {
-  status: 'submitted' | 'failed' | 'skipped_budget';
+  /** `paused`: the shared cap stopped it; run it again with `messages` to continue. */
+  status: 'submitted' | 'failed' | 'skipped_budget' | 'paused';
   /** The final tool's input, not yet validated. Set when `status` is `submitted`. */
   submitted?: unknown;
   /** The conversation including the model's replies, to continue from. */
@@ -151,6 +159,7 @@ export class ToolLoop {
                 this.outputTokens += stepOut;
                 this.costUsd += stepCost;
                 options.budget.record(stepCost, stepIn + stepOut);
+                options.pauseAt?.record(stepCost, stepIn + stepOut);
                 this.contextTokens = stepIn + stepOut;
                 this.cachedTokens = cacheReadTokens + cacheWriteTokens;
                 options.onStep?.(this.usage());
@@ -190,6 +199,12 @@ export class ToolLoop {
     return this.options.budget.canAfford(this.forcedStepUsd(), this.stepTokens());
   }
 
+  /** True when the shared cap, not this loop's own, cannot pay for the next call. */
+  private mustPause(): boolean {
+    const pauseAt = this.options.pauseAt;
+    return pauseAt !== undefined && !pauseAt.canAfford(this.forcedStepUsd(), 0);
+  }
+
   private refused(): boolean {
     return this.lastFinish === 'content-filter';
   }
@@ -209,10 +224,11 @@ export class ToolLoop {
     if (!this.canAffordNext()) {
       return done({ status: 'skipped_budget', error: 'spend cap reached before this finding' });
     }
+    if (this.mustPause()) return done({ status: 'paused' });
 
     const caching = options.promptCaching ?? true;
     const marked = (current: ModelMessage[], indexes: number[]) => (caching ? withCacheBreakpoints(current, indexes) : current);
-    const outOfBudget: StopCondition<ToolSet> = () => !this.canAffordForced();
+    const outOfBudget: StopCondition<ToolSet> = () => !this.canAffordForced() || this.mustPause();
     const forced = options.forcedToolChoice ?? true;
     const { finalTool } = request;
 
@@ -257,10 +273,14 @@ export class ToolLoop {
         finish = result.steps.at(-1)?.finishReason ?? 'unknown';
         const answeredInProse = result.steps.at(-1)?.toolCalls.length === 0;
         if (submitted || !answeredInProse || this.refused() || reminders >= MAX_REMINDERS) break;
+        if (this.mustPause()) break;
         if (this.steps >= maxSteps || !this.canAffordForced()) break;
         messages = [...messages, { role: 'user', content: request.reminder }];
       }
 
+      if (!submitted && this.canAffordForced() && this.steps < maxSteps && this.mustPause() && !this.refused()) {
+        return done({ status: 'paused' });
+      }
       if (!submitted) {
         const stoppedForBudget = !this.canAffordNext();
         const steps = this.steps;

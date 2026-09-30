@@ -61,13 +61,25 @@ export function costOf(pricing: ModelPricing, usage: Usage): number {
 export class SpendBudget {
   private spent = 0;
   private tokens = 0;
+  private limit: number;
 
   constructor(
-    readonly limitUsd: number,
+    limitUsd: number,
     readonly limitTokens = Number.POSITIVE_INFINITY,
   ) {
     if (!(limitUsd >= 0)) throw new Error(`invalid spend limit: ${limitUsd}`);
     if (!(limitTokens > 0)) throw new Error(`invalid token limit: ${limitTokens}`);
+    this.limit = limitUsd;
+  }
+
+  get limitUsd(): number {
+    return this.limit;
+  }
+
+  /** Raises the dollar cap, when a person agrees at a checkpoint to spend more. */
+  extend(usd: number): void {
+    if (!(usd > 0)) throw new Error(`invalid extension: ${usd}`);
+    this.limit += usd;
   }
 
   get spentUsd(): number {

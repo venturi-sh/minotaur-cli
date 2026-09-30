@@ -592,3 +592,58 @@ describe('minotaur fix', () => {
     await expect(main(['fix', sql.id, root, ...sources(), ...model()])).rejects.toThrow('already exists');
   });
 });
+
+describe('minotaur fix --all', () => {
+  const SAFE_LINE = "  const sql = 'SELECT * FROM Users WHERE email = ?';";
+  const fixCalls = (): ToolCall[][] => [
+    [{ name: 'replace_in_file', args: { path: 'routes/login.js', oldText: QUERY_LINE, newText: SAFE_LINE } }],
+    [{ name: 'submit_fix', args: { outcome: 'fixed', summary: 'Used a placeholder for the email.', notes: [] } }],
+  ];
+
+  beforeEach(() => {
+    for (const name of ['AUTHOR', 'COMMITTER']) {
+      vi.stubEnv(`GIT_${name}_NAME`, 't');
+      vi.stubEnv(`GIT_${name}_EMAIL`, 't@t');
+    }
+  });
+
+  it('fixes every open finding on the batch branch, and a secret it cannot fix is not a failure', async () => {
+    script = fixCalls();
+    expect(await main(['fix', '--all', root, ...sources(), ...model(), '--allow-unverified', '--focus', 'noise', '--json'])).toBe(0);
+    const run = JSON.parse(stdout);
+    expect(run.branch).toMatch(/^minotaur\/fixes-/);
+    expect(run.results.map((result: { finding: { kind: string }; status: string }) => `${result.finding.kind}:${result.status}`).sort()).toEqual([
+      'sast:committed_unverified',
+      'secret:skipped',
+    ]);
+    expect(run.resume).toBeNull();
+  });
+
+  it('leaves out findings a person closed', async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    expect(await main(['mark', sql.id, 'false-positive', root, ...sources(), '--reason', 'test'])).toBe(0);
+    stdout = '';
+    expect(await main(['fix', '--all', root, ...sources(), ...model(), '--focus', 'noise', '--json'])).toBe(0);
+    const run = JSON.parse(stdout);
+    expect(run.results.map((result: { finding: { kind: string } }) => result.finding.kind)).toEqual(['secret']);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('stops at the cap with exit code 3 when there is no terminal to ask, and says how to resume', async () => {
+    vi.stubEnv('MINOTAUR_PRICE_INPUT_PER_MTOK', '3');
+    vi.stubEnv('MINOTAUR_PRICE_OUTPUT_PER_MTOK', '15');
+    script = fixCalls();
+    expect(await main(['fix', '--all', root, ...sources(), ...model(), '--focus', 'noise', '--max-total-usd', '0.01', '--json'])).toBe(3);
+    const run = JSON.parse(stdout);
+    expect(run.stoppedAtCap).toBe(true);
+    expect(run.results.map((result: { status: string }) => result.status)).toContain('stopped_at_cap');
+    expect(run.resume).toMatch(/^minotaur fix --all .* --commit [0-9a-f]{40} --resume$/);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('rejects flags that contradict each other', async () => {
+    await expect(main(['fix', '--all', 'abcd1234', root])).rejects.toThrow('no finding ids');
+    await expect(main(['fix', 'abcd1234', '--resume', '--force'])).rejects.toThrow('use one');
+    await expect(main(['fix'])).rejects.toThrow('or --all');
+  });
+});

@@ -178,11 +178,13 @@ const FIX_LABEL: Record<FixStatus, string> = {
   failed: 'Not fixed',
   gave_up: 'Gave up',
   stopped_at_limit: 'Stopped at the limit',
+  stopped_at_cap: 'Stopped at the batch cap',
+  not_tried: 'Not tried',
   skipped: 'Skipped',
 };
 
 /** The result of `minotaur fix`: what happened to each finding, and where the commits are. */
-export function renderFixRun(run: FixRun, base: string, style: Style): string {
+export function renderFixRun(run: FixRun, base: string, style: Style, resume: string | null = null): string {
   const committed = run.results.filter((result) => result.commit !== null);
   const lines: string[] = [];
   for (const result of run.results) {
@@ -212,7 +214,10 @@ export function renderFixRun(run: FixRun, base: string, style: Style): string {
   } else {
     lines.push(`${style.bold(done)}. No branch was kept.`);
   }
+  if (run.alreadyOnBranch > 0) lines.push(style.dim(`${run.alreadyOnBranch} more ${run.alreadyOnBranch === 1 ? 'was' : 'were'} already fixed on the branch.`));
+  if (run.stoppedAtCap) lines.push(style.yellow('Stopped at the spend cap for the run.'));
   if (run.interrupted) lines.push(style.yellow('Stopped with Ctrl-C before every finding was tried.'));
+  if (resume) lines.push(`To continue, with the same options: ${resume}`);
   return lines.join('\n');
 }
 

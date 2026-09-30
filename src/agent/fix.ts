@@ -24,11 +24,15 @@ export interface FixAgentOptions {
   model: LanguageModel;
   pricing: ModelPricing;
   budget: SpendBudget;
+  /** The batch's cap: when it runs out the fix pauses, and `resume` continues it. */
+  pauseAt?: SpendBudget | undefined;
   maxSteps: number;
   abortSignal?: AbortSignal | undefined;
   effort?: Effort | undefined;
   forcedToolChoice?: boolean | undefined;
   promptCaching?: boolean | undefined;
+  /** Extra instructions for this finding's kind, such as how a dependency is upgraded here. */
+  guidance?: string | undefined;
   /** An earlier exploitability check, whose notes help find the cause. */
   earlier?: EarlierCheck | undefined;
   onStep?: ((progress: FixProgress) => void) | undefined;
@@ -40,7 +44,8 @@ export interface FixProgress extends LoopUsage {
 }
 
 export interface FixAttempt extends LoopUsage {
-  status: 'submitted' | 'failed' | 'skipped_budget';
+  /** `paused`: the batch's cap was reached; call `resume` once it is raised. */
+  status: 'submitted' | 'failed' | 'skipped_budget' | 'paused';
   submission?: FixSubmission;
   /** Every file edited so far, across attempts. */
   changedFiles: string[];
@@ -73,6 +78,7 @@ export class FixSession {
       model: options.model,
       pricing: options.pricing,
       budget: options.budget,
+      pauseAt: options.pauseAt,
       maxSteps: options.maxSteps,
       allowance: FIX_ALLOWANCE,
       abortSignal: options.abortSignal,
@@ -85,12 +91,17 @@ export class FixSession {
 
   /** The first attempt. */
   start(): Promise<FixAttempt> {
-    return this.attempt([{ role: 'user', content: renderFixRequest(this.subject, this.options.earlier) }]);
+    return this.attempt([{ role: 'user', content: renderFixRequest(this.subject, this.options.earlier, this.options.guidance) }]);
   }
 
   /** Another attempt in the same conversation, after the fix did not pass. `feedback` says why. */
   retry(feedback: string): Promise<FixAttempt> {
     return this.attempt([...this.messages, { role: 'user', content: feedback }]);
+  }
+
+  /** Continues a paused attempt from where it stopped. */
+  resume(): Promise<FixAttempt> {
+    return this.attempt(this.messages);
   }
 
   /** False once the steps or the budget would not allow another attempt. */

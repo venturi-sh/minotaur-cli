@@ -134,7 +134,9 @@ export async function triageFinding(
     steps: outcome.steps,
   };
   if (outcome.status !== 'submitted') {
-    return { ...base, status: outcome.status, ...(outcome.error ? { error: outcome.error } : {}) };
+    // Triage has no shared cap, so it never pauses; a pause would still be no answer.
+    const status = outcome.status === 'paused' ? 'failed' : outcome.status;
+    return { ...base, status, ...(outcome.error ? { error: outcome.error } : {}) };
   }
 
   try {

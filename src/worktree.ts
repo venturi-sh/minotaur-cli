@@ -40,13 +40,26 @@ export async function branchExists(top: string, name: string): Promise<boolean> 
 
 /**
  * Makes the branch at the target commit and checks it out in a new worktree.
- * An existing branch is an error unless `force`, which moves it.
+ * An existing branch is an error unless `force`, which moves it, or `resume`,
+ * which carries on from its last commit. A resumed branch must have started
+ * from the target commit, since that is what the findings describe.
  */
-export async function openFixBranch(target: Target, name: string, cache: string, options: { force?: boolean } = {}): Promise<FixBranch> {
+export async function openFixBranch(
+  target: Target,
+  name: string,
+  cache: string,
+  options: { force?: boolean; resume?: boolean } = {},
+): Promise<FixBranch> {
   const top = target.top;
   if ((await git(top, ['check-ref-format', '--branch', name])).code !== 0) throw new WorktreeError(`"${name}" is not a valid branch name`);
-  if (!options.force && (await branchExists(top, name))) {
-    throw new WorktreeError(`branch ${name} already exists; delete it, or pass --force to replace it`);
+  const exists = await branchExists(top, name);
+  if (options.resume) {
+    if (!exists) throw new WorktreeError(`there is no branch ${name} to resume; run without --resume to start it`);
+    if ((await git(top, ['merge-base', '--is-ancestor', target.commit.sha, name])).code !== 0) {
+      throw new WorktreeError(`branch ${name} does not start from ${target.commit.short}; pass the commit it started from with --commit`);
+    }
+  } else if (!options.force && exists) {
+    throw new WorktreeError(`branch ${name} already exists; pass --resume to continue it, or --force to replace it`);
   }
   const worktrees = join(cache, 'worktrees', createHash('sha256').update(top).digest('hex').slice(0, 16));
   const worktree = join(worktrees, name.replace(/[^A-Za-z0-9._-]/g, '_'));
@@ -55,7 +68,8 @@ export async function openFixBranch(target: Target, name: string, cache: string,
   await rm(worktree, { recursive: true, force: true });
   await git(top, ['worktree', 'prune']);
   await mkdir(worktrees, { recursive: true, mode: 0o700 });
-  await must(top, ['worktree', 'add', '-q', options.force ? '-B' : '-b', name, worktree, target.commit.sha], `could not make branch ${name}`);
+  const add = options.resume ? ['worktree', 'add', '-q', worktree, name] : ['worktree', 'add', '-q', options.force ? '-B' : '-b', name, worktree, target.commit.sha];
+  await must(top, add, `could not ${options.resume ? 'check out' : 'make'} branch ${name}`);
   return { name, base: target.commit.sha, worktree, tree: join(worktree, target.prefix), top };
 }
 
@@ -74,6 +88,26 @@ export async function uncommittedDiff(branch: FixBranch, files: readonly string[
   // Intent-to-add makes new files show in the diff without staging their content.
   await git(branch.worktree, ['add', '-N', '--', ...paths]);
   return must(branch.worktree, ['diff', '--no-color', '--no-ext-diff', 'HEAD', '--', ...paths], 'could not diff the fix');
+}
+
+/**
+ * Files that differ from the last commit, new ones included, relative to the
+ * tree. What a package manager changed is only known this way.
+ */
+export async function changedPaths(branch: FixBranch): Promise<string[]> {
+  const tracked = await must(branch.tree, ['diff', '--name-only', '--relative', '-z', 'HEAD'], 'could not list changed files');
+  const untracked = await must(branch.tree, ['ls-files', '--others', '--exclude-standard', '-z'], 'could not list new files');
+  return [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort();
+}
+
+/** The findings the branch already has a commit for, from their `Minotaur-Finding` trailers. */
+export async function fixedOnBranch(branch: FixBranch): Promise<Set<string>> {
+  const log = await must(
+    branch.worktree,
+    ['log', '--format=%(trailers:key=Minotaur-Finding,valueonly,separator=%x00)', `${branch.base}..HEAD`],
+    'could not read the branch',
+  );
+  return new Set(log.split(/[\0\n]/).map((line) => line.trim()).filter(Boolean));
 }
 
 /** Drops every uncommitted edit, so the next fix starts from the last commit. */
