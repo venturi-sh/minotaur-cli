@@ -289,7 +289,7 @@ export type FixEvent =
   | { type: 'upgrade'; finding: LocalFinding; description: string }
   | { type: 'verify'; finding: LocalFinding; scanners: string[] }
   | { type: 'retry'; finding: LocalFinding; problems: string[] }
-  | { type: 'resumed'; alreadyOnBranch: number }
+  | { type: 'already_fixed'; count: number }
   | { type: 'done'; result: FixResult };
 
 /** What a person is shown at the batch's checkpoint. */
@@ -325,9 +325,8 @@ export interface RunFixesOptions {
   includeIgnored: boolean;
   branch: string;
   cache: string;
+  /** Start the branch again from the target commit, dropping its earlier fixes. */
   force?: boolean;
-  /** Continue the branch from an earlier run, skipping what it already fixed. */
-  resume?: boolean;
   allowUnverified?: boolean;
   /** Earlier exploitability checks, by fingerprint. */
   earlier?: ReadonlyMap<string, EarlierCheck>;
@@ -348,7 +347,7 @@ export interface FixRun {
   interrupted: boolean;
   /** True when the person, or the lack of one to ask, stopped the run at the batch's cap. */
   stoppedAtCap: boolean;
-  /** Findings a resumed run skipped because the branch already has their commit. */
+  /** Findings skipped because the branch already has a commit for them. */
   alreadyOnBranch: number;
 }
 
@@ -364,7 +363,7 @@ interface RunState {
 }
 
 export async function runFixes(options: RunFixesOptions): Promise<FixRun> {
-  const branch = await openFixBranch(options.target, options.branch, options.cache, { force: options.force ?? false, resume: options.resume ?? false });
+  const branch = await openFixBranch(options.target, options.branch, options.cache, { force: options.force ?? false });
   const rescan: Rescan =
     options.rescan ??
     ((tree, sources) => collectFindings(tree, sources, { includeIgnored: options.includeIgnored, managed: options.managed ?? {} }));
@@ -381,17 +380,16 @@ export async function runFixes(options: RunFixesOptions): Promise<FixRun> {
   let todo = [...options.findings];
   let alreadyOnBranch = 0;
   try {
-    if (options.resume) {
-      const done = await fixedOnBranch(branch);
-      todo = todo.filter((finding) => !done.has(finding.fingerprint));
-      alreadyOnBranch = options.findings.length - todo.length;
-      options.onEvent?.({ type: 'resumed', alreadyOnBranch });
-      // Earlier commits may have fixed more than they name, so the branch is scanned once as it is now.
-      if ((await commitsOnBranch(branch)) > 0) {
-        const scanners = options.sources.filter((source) => 'scanner' in source);
-        const now = await rescan(branch.tree, scanners);
-        state.baseline.accept(now.findings, scanners.map((source) => ('scanner' in source ? source.scanner : '')), 'an earlier commit on the branch');
-      }
+    // The branch is shared by every run: what it already fixed is skipped.
+    const done = await fixedOnBranch(branch);
+    todo = todo.filter((finding) => !done.has(finding.fingerprint));
+    alreadyOnBranch = options.findings.length - todo.length;
+    if (alreadyOnBranch > 0) options.onEvent?.({ type: 'already_fixed', count: alreadyOnBranch });
+    // Earlier commits may have fixed more than they name, and the branch's code differs from the scan's, so it is scanned once as it is now.
+    if (todo.length > 0 && (await commitsOnBranch(branch)) > 0) {
+      const scanners = options.sources.filter((source) => 'scanner' in source);
+      const now = await rescan(branch.tree, scanners);
+      state.baseline.accept(now.findings, scanners.map((source) => ('scanner' in source ? source.scanner : '')), 'an earlier commit on the branch');
     }
     for (const [index, finding] of todo.entries()) {
       if (options.abortSignal?.aborted || state.stoppedAtCap) {

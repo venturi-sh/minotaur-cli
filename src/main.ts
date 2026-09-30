@@ -84,15 +84,17 @@ import { protectedReason } from './core/index.js';
 import { planUpgrade } from './upgrade.js';
 import { runFixes, upgradeVersion, verifyAgentFix, type Checkpoint, type FixEvent, type FixResult } from './fix.js';
 import {
-  branchExists,
-  branchName,
   closeFixBranch,
+  DEFAULT_BRANCH,
+  discardChanges,
   commitDiff,
   existingFixBranch,
   fixedOnBranch,
   openFixBranch,
   pendingFixes,
+  readClaim,
   WorktreeError,
+  writeClaim,
 } from './worktree.js';
 import type { FixView } from './interactive/state.js';
 
@@ -191,9 +193,10 @@ verdict:
   --findings FILE        Read findings from "scan --json" instead of scanning
 
 fix:
-  Each fix is made in a separate worktree from the commit, and committed on the
-  branch minotaur/fix-ID, or minotaur/fixes-COMMIT for several findings. Your
-  working tree does not change. A fix is committed only when the scanners that
+  Each fix is made in a separate worktree and committed on one branch,
+  minotaur/fixes, one commit per fix. Every run adds to it, and skips findings
+  it already has a fix for. When the commit is newer than the branch, it is
+  merged into the branch first. Your working tree does not change. A fix is committed only when the scanners that
   reported the finding run again and no longer report it, report nothing as
   severe in the changed files, and the change does not silence them. A fix that
   fails gets one more attempt.
@@ -208,10 +211,10 @@ fix:
   --max-total-usd N      Spend for the whole run before Minotaur asks whether to go
                          on (default ${DEFAULT_MAX_TOTAL_USD} for several findings). Each "yes" allows N
                          more. Without a terminal to ask, the run stops, with exit
-                         code 3; --resume continues it.
-  --resume               Continue the branch of an earlier run, skipping the
-                         findings it already has a commit for
-  --force                Replace the branch if it already exists
+                         code 3; the same command again continues it.
+  --branch NAME          Commit on this branch instead of minotaur/fixes
+  --force                Start the branch again from the commit, dropping its
+                         earlier fixes
   --allow-unverified     Commit a fix even when no scanner can run again to check
                          it, such as a finding read from a report file
   --verify               Check and commit what an agent changed after
@@ -262,7 +265,7 @@ const OPTIONS = {
   file: { type: 'string' },
   agent: { type: 'string' },
   force: { type: 'boolean' },
-  resume: { type: 'boolean' },
+  branch: { type: 'string' },
   fix: { type: 'boolean' },
   verify: { type: 'boolean' },
   discard: { type: 'boolean' },
@@ -331,7 +334,6 @@ export async function main(argv: readonly string[]): Promise<number> {
     return values.verify ? verifyAgent(id, await repoRoot(path), values) : discardAgent(id, await repoRoot(path), values);
   }
   if (command === 'fix') {
-    if (values.resume && values.force) throw new UsageError('--resume continues the branch and --force replaces it; use one');
     if (values.all) {
       if (rest.length > 1) throw new UsageError('fix --all takes at most one path, and no finding ids');
       return fix(null, await repoRoot(rest[0]), values);
@@ -634,7 +636,7 @@ async function interactive(root: string, values: Values): Promise<number> {
     fix: (findings, options) => {
       const running = (async () => {
         // A branch from an earlier fix of the same findings is continued, not refused.
-        const name = findings.length === 1 ? branchName([findings[0]!.id], where.commit.short) : branchName([], where.commit.short);
+        const name = fixBranchName(values);
         const scanned = decided(undecided!, await loadDecisions(root)).findings;
         const run = await runFixes({
           target: where,
@@ -650,7 +652,6 @@ async function interactive(root: string, values: Values): Promise<number> {
           includeIgnored: values['include-ignored'] ?? false,
           branch: name,
           cache: cacheDir(),
-          resume: await branchExists(where.top, name),
           allowUnverified: values['allow-unverified'] ?? false,
           abortSignal: options.signal,
           onEvent: options.onEvent,
@@ -721,6 +722,10 @@ async function fixesOnBranches(where: Target, findings: readonly LocalFinding[])
 
 function describeBranchFixes(count: number, branches: readonly string[]): string {
   return `${count} finding${count === 1 ? ' has a fix' : 's have fixes'} on ${branches.length === 1 ? `branch ${branches[0]}` : `${branches.length} branches`}, not merged yet; merge ${branches.length === 1 ? 'it' : 'them'} to close ${count === 1 ? 'it' : 'them'}.`;
+}
+
+function fixBranchName(values: Values): string {
+  return values.branch?.trim() || DEFAULT_BRANCH;
 }
 
 function commitLabel(where: Target): string {
@@ -948,12 +953,13 @@ async function brief(id: string, root: string, values: Values): Promise<number> 
 async function briefFix(id: string, root: string, values: Values): Promise<number> {
   const { finding, where, protectedPaths } = await openFinding(id, root, values);
   if (!finding.location) throw new Error('the scanner gave no file for this finding, so there is nothing to edit');
-  const name = branchName([finding.id], where.commit.short);
+  const name = fixBranchName(values);
   const cache = cacheDir();
-  let branch = await existingFixBranch(where, name, cache);
-  if (!branch) {
+  let branch = await existingFixBranch(where, name, cache).catch(() => null);
+  // The worktree is shared: it is this finding's only while the agent works on it.
+  if (!branch || (await readClaim(branch.worktree))?.fingerprint !== finding.fingerprint) {
     try {
-      branch = await openFixBranch(where, name, cache, { resume: await branchExists(where.top, name) });
+      branch = await openFixBranch(where, name, cache);
     } catch (error) {
       if (error instanceof WorktreeError) throw new UsageError(error.message);
       throw error;
@@ -962,6 +968,7 @@ async function briefFix(id: string, root: string, values: Values): Promise<numbe
       await closeFixBranch(branch);
       throw new UsageError(`branch ${name} already has a fix for ${finding.id}; review it with: git log -p ${where.commit.short}..${name}`);
     }
+    await writeClaim(branch, { id: finding.id, fingerprint: finding.fingerprint });
   }
 
   const secret = finding.kind === 'secret' || protectedReason(finding.location.path, protectedPaths) !== null;
@@ -985,7 +992,7 @@ async function briefFix(id: string, root: string, values: Values): Promise<numbe
   // A secret's snippet is the secret; it stays out of the brief.
   const subject = toSubject(finding);
   const shown = secret && subject.location ? { ...subject, location: { ...subject.location, snippet: undefined } } : subject;
-  const at = [finding.id, root, '--commit', where.commit.sha];
+  const at = [finding.id, root, '--commit', where.commit.sha, ...(values.branch ? ['--branch', values.branch] : [])];
   process.stdout.write(
     `${JSON.stringify(
       {
@@ -1010,11 +1017,15 @@ async function verifyAgent(id: string, root: string, values: Values): Promise<nu
   const { config } = await loadConfig(root);
   const opened = await openFinding(id, root, values);
   const { finding, where } = opened;
-  const name = branchName([finding.id], where.commit.short);
+  const name = fixBranchName(values);
   const branch = await existingFixBranch(where, name, cacheDir()).catch((error: Error) => {
     throw new UsageError(error.message);
   });
-  if (!branch) throw new UsageError(`there is no worktree for ${finding.id}; run "minotaur brief ${finding.id} ${root} --fix --json" first`);
+  const claim = branch ? await readClaim(branch.worktree) : null;
+  if (!branch || claim?.fingerprint !== finding.fingerprint) {
+    const other = claim ? ` The worktree of ${name} has the edits for ${claim.id}.` : '';
+    throw new UsageError(`there is no fix of ${finding.id} in progress; run "minotaur brief ${finding.id} ${root} --fix --json" first.${other}`);
+  }
   const result = await verifyAgentFix({
     branch,
     finding,
@@ -1042,14 +1053,16 @@ async function verifyAgent(id: string, root: string, values: Values): Promise<nu
 /** `minotaur fix ID --discard`: removes an agent's worktree, and its branch when nothing was committed on it. */
 async function discardAgent(id: string, root: string, values: Values): Promise<number> {
   const { finding, where } = await openFinding(id, root, values);
-  const name = branchName([finding.id], where.commit.short);
+  const name = fixBranchName(values);
   const branch = await existingFixBranch(where, name, cacheDir()).catch(() => null);
-  if (!branch) {
-    process.stdout.write(`There is no worktree for ${finding.id}.\n`);
+  const claim = branch ? await readClaim(branch.worktree) : null;
+  if (!branch || claim?.fingerprint !== finding.fingerprint) {
+    process.stdout.write(`There is no fix of ${finding.id} in progress.\n`);
     return 0;
   }
+  await discardChanges(branch);
   const { kept } = await closeFixBranch(branch);
-  process.stdout.write(kept ? `Removed the worktree; branch ${name} keeps its earlier commits.\n` : `Removed the worktree and branch ${name}.\n`);
+  process.stdout.write(kept ? `Removed the edits for ${finding.id}; branch ${name} keeps its earlier fixes.\n` : `Removed the edits for ${finding.id} and the empty branch ${name}.\n`);
   return 0;
 }
 
@@ -1105,12 +1118,11 @@ async function fix(ids: readonly string[] | null, root: string, values: Values):
     const check = checks.get(finding.fingerprint)?.result;
     if (check?.status === 'succeeded' && check.exploitability && check.rationale) earlier.set(finding.fingerprint, earlierFrom(check, finding, 'the earlier check'));
   }
-  // --all always gets the batch branch, so --resume finds it even when fewer findings are left.
-  const branch = ids ? branchName(findings.map((finding) => finding.id), where.commit.short) : branchName([], where.commit.short);
+  const branch = fixBranchName(values);
   const maxTotalUsd = positiveNumber(values['max-total-usd'], '--max-total-usd') ?? (findings.length > 1 ? DEFAULT_MAX_TOTAL_USD : undefined);
-  const resume = ['minotaur', 'fix', ...(ids ?? ['--all']), root, '--commit', where.commit.sha, '--resume'].join(' ');
+  const again = ['minotaur', 'fix', ...(ids ?? ['--all']), root, '--commit', where.commit.sha, ...(values.branch ? ['--branch', values.branch] : [])].join(' ');
 
-  info(`\n${values.resume ? 'Continuing' : 'Fixing'} ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} on branch ${branch}, from ${describeCommit(where.commit)}.`);
+  info(`\nFixing ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} on branch ${branch}, from ${describeCommit(where.commit)}.`);
   if (model) {
     info(`Code is sent to ${describeModel(model)}.`);
     info(`Limits for each finding: ${describeLimits(model, limits)}.${maxTotalUsd ? ` Minotaur asks before the run spends more than $${maxTotalUsd}.` : ''}`);
@@ -1138,7 +1150,6 @@ async function fix(ids: readonly string[] | null, root: string, values: Values):
       branch,
       cache: cacheDir(),
       force: values.force ?? false,
-      resume: values.resume ?? false,
       allowUnverified: values['allow-unverified'] ?? false,
       earlier,
       managed: { onDownload: info },
@@ -1147,9 +1158,9 @@ async function fix(ids: readonly string[] | null, root: string, values: Values):
     });
     const unfinished = run.stoppedAtCap || run.interrupted;
     if (values.json) {
-      process.stdout.write(`${JSON.stringify({ base: where.commit.sha, ...run, resume: unfinished ? resume : null }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({ base: where.commit.sha, ...run, continue: unfinished ? again : null }, null, 2)}\n`);
     } else {
-      process.stdout.write(`\n${renderFixRun(run, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN, unfinished ? resume : null)}\n`);
+      process.stdout.write(`\n${renderFixRun(run, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN, unfinished ? again : null)}\n`);
     }
     if (run.stoppedAtCap) return 3;
     // With --all, what cannot be fixed here, such as a secret, is expected; with named ids it is a failure.
@@ -1197,8 +1208,8 @@ function fixReporter(): (event: FixEvent) => void {
       info(`  step ${progress.steps} of at most ${event.maxSteps}: ${tokens} tokens so far${cost}${edited}`);
     } else if (event.type === 'upgrade') {
       info(`  ${event.description}`);
-    } else if (event.type === 'resumed') {
-      if (event.alreadyOnBranch > 0) info(`${event.alreadyOnBranch} already fixed on the branch.`);
+    } else if (event.type === 'already_fixed') {
+      info(`${event.count} already fixed on the branch.`);
     } else if (event.type === 'verify') {
       info(event.scanners.length > 0 ? `  running ${event.scanners.join(', ')} again` : '  no scanner can run again to check this fix');
     } else if (event.type === 'retry') {

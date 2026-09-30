@@ -9,7 +9,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, realpath, rm } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import type { Target } from './commit.js';
@@ -29,53 +29,105 @@ export interface FixBranch {
   top: string;
 }
 
-/** `minotaur/fix-<id>` for one finding, `minotaur/fixes-<commit>` for several. */
-export function branchName(ids: readonly string[], commitShort: string): string {
-  return ids.length === 1 ? `minotaur/fix-${ids[0]}` : `minotaur/fixes-${commitShort}`;
-}
+/** Every fix goes on this branch unless another is named: one branch to review, one commit per fix. */
+export const DEFAULT_BRANCH = 'minotaur/fixes';
 
 export async function branchExists(top: string, name: string): Promise<boolean> {
   return (await git(top, ['rev-parse', '-q', '--verify', `refs/heads/${name}`])).code === 0;
 }
 
 /**
- * Makes the branch at the target commit and checks it out in a new worktree.
- * An existing branch is an error unless `force`, which moves it, or `resume`,
- * which carries on from its last commit. A resumed branch must have started
- * from the target commit, since that is what the findings describe.
+ * Checks out the fix branch in its worktree, making the branch at the target
+ * commit when it does not exist, or when `force` starts it again.
+ *
+ * An existing branch is continued. When the target commit is newer than the
+ * branch, it is merged in first, so each fix is made and verified on the code
+ * the findings came from; a branch that was already merged just moves forward.
+ * A merge that conflicts is left for the person.
+ *
+ * The worktree is shared by every fix of the branch, and an agent's fix waits
+ * in it between commands. Uncommitted edits there are never thrown away.
  */
-export async function openFixBranch(
-  target: Target,
-  name: string,
-  cache: string,
-  options: { force?: boolean; resume?: boolean } = {},
-): Promise<FixBranch> {
+export async function openFixBranch(target: Target, name: string, cache: string, options: { force?: boolean } = {}): Promise<FixBranch> {
   const top = target.top;
   if ((await git(top, ['check-ref-format', '--branch', name])).code !== 0) throw new WorktreeError(`"${name}" is not a valid branch name`);
-  const exists = await branchExists(top, name);
-  if (options.resume) {
-    if (!exists) throw new WorktreeError(`there is no branch ${name} to resume; run without --resume to start it`);
-    if ((await git(top, ['merge-base', '--is-ancestor', target.commit.sha, name])).code !== 0) {
-      throw new WorktreeError(`branch ${name} does not start from ${target.commit.short}; pass the commit it started from with --commit`);
-    }
-  } else if (!options.force && exists) {
-    throw new WorktreeError(`branch ${name} already exists; pass --resume to continue it, or --force to replace it`);
-  }
   const worktree = worktreeDir(top, name, cache);
-  const worktrees = dirname(worktree);
-  // Left over from a run that was killed: git still lists it, and a branch checked out there cannot be moved.
+  if ((await isWorktree(top, worktree)) && (await hasEdits(worktree))) {
+    const claim = await readClaim(worktree);
+    const who = claim ? ` for finding ${claim.id}` : '';
+    const next = claim ? `run "minotaur fix ${claim.id} --verify" to commit them, or "minotaur fix ${claim.id} --discard"` : 'commit or remove them';
+    throw new WorktreeError(`branch ${name} has uncommitted edits${who} in ${join(worktree, target.prefix)}; ${next} first`);
+  }
+  // Left over from a run that was killed, or from an agent's fix that was committed or abandoned.
+  await removeWorktree(top, worktree);
+  await mkdir(dirname(worktree), { recursive: true, mode: 0o700 });
+  const exists = await branchExists(top, name);
+  if (!exists || options.force) {
+    await must(top, ['worktree', 'add', '-q', options.force ? '-B' : '-b', name, worktree, target.commit.sha], `could not make branch ${name}`);
+  } else {
+    await must(top, ['worktree', 'add', '-q', worktree, name], `could not check out branch ${name}`);
+    await catchUp(top, worktree, name, target);
+  }
+  return { name, base: target.commit.sha, worktree, tree: join(worktree, target.prefix), top };
+}
+
+/** Brings the branch up to the target commit: a fast-forward when it has no fixes of its own, a merge when it does. */
+async function catchUp(top: string, worktree: string, name: string, target: Target): Promise<void> {
+  if ((await git(worktree, ['merge-base', '--is-ancestor', target.commit.sha, 'HEAD'])).code === 0) return;
+  const merged = await git(worktree, ['merge', '--no-edit', '-q', '-m', `Merge ${target.commit.short} into ${name}`, target.commit.sha]);
+  if (merged.code === 0) return;
+  await git(worktree, ['merge', '--abort']);
+  await removeWorktree(top, worktree);
+  const why = merged.stderr.trim().split('\n').slice(-2).join(' ') || 'the merge failed';
+  throw new WorktreeError(
+    `branch ${name} cannot take the changes of ${target.commit.short} (${why}); merge ${target.commit.short} into it yourself, or pass --force to start it again from ${target.commit.short}`,
+  );
+}
+
+async function isWorktree(top: string, worktree: string): Promise<boolean> {
+  const real = await realpath(worktree).catch(() => null);
+  if (!real) return false;
+  const listed = (await git(top, ['worktree', 'list', '--porcelain'])).stdout.split('\n');
+  const paths = await Promise.all(listed.filter((line) => line.startsWith('worktree ')).map((line) => realpath(line.slice(9)).catch(() => '')));
+  return paths.includes(real);
+}
+
+async function hasEdits(worktree: string): Promise<boolean> {
+  const status = await git(worktree, ['status', '--porcelain', '--untracked-files=all']);
+  return status.code === 0 && status.stdout.trim().length > 0;
+}
+
+async function removeWorktree(top: string, worktree: string): Promise<void> {
   await git(top, ['worktree', 'remove', '--force', worktree]);
   await rm(worktree, { recursive: true, force: true });
   await git(top, ['worktree', 'prune']);
-  await mkdir(worktrees, { recursive: true, mode: 0o700 });
-  const add = options.resume ? ['worktree', 'add', '-q', worktree, name] : ['worktree', 'add', '-q', options.force ? '-B' : '-b', name, worktree, target.commit.sha];
-  await must(top, add, `could not ${options.resume ? 'check out' : 'make'} branch ${name}`);
-  return { name, base: target.commit.sha, worktree, tree: join(worktree, target.prefix), top };
 }
 
 /** Where a branch's worktree is kept in the cache. */
 export function worktreeDir(top: string, name: string, cache: string): string {
   return join(cache, 'worktrees', createHash('sha256').update(top).digest('hex').slice(0, 16), name.replace(/[^A-Za-z0-9._-]/g, '_'));
+}
+
+/** Which finding an agent is fixing in the worktree, kept beside it between `brief --fix` and `fix --verify`. */
+export interface Claim {
+  id: string;
+  fingerprint: string;
+}
+
+function claimPath(worktree: string): string {
+  return `${worktree}.claim.json`;
+}
+
+export async function readClaim(worktree: string): Promise<Claim | null> {
+  try {
+    return JSON.parse(await readFile(claimPath(worktree), 'utf8')) as Claim;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeClaim(branch: FixBranch, claim: Claim): Promise<void> {
+  await writeFile(claimPath(branch.worktree), JSON.stringify(claim), { mode: 0o600 });
 }
 
 /**
@@ -84,13 +136,9 @@ export function worktreeDir(top: string, name: string, cache: string): string {
  */
 export async function existingFixBranch(target: Target, name: string, cache: string): Promise<FixBranch | null> {
   const worktree = worktreeDir(target.top, name, cache);
-  const real = await realpath(worktree).catch(() => null);
-  if (!real) return null;
-  const listed = (await git(target.top, ['worktree', 'list', '--porcelain'])).stdout.split('\n');
-  const paths = await Promise.all(listed.filter((line) => line.startsWith('worktree ')).map((line) => realpath(line.slice(9)).catch(() => '')));
-  if (!paths.includes(real)) return null;
-  if ((await git(target.top, ['merge-base', '--is-ancestor', target.commit.sha, name])).code !== 0) {
-    throw new WorktreeError(`branch ${name} does not start from ${target.commit.short}; pass the commit it started from with --commit`);
+  if (!(await isWorktree(target.top, worktree))) return null;
+  if ((await git(worktree, ['merge-base', '--is-ancestor', target.commit.sha, 'HEAD'])).code !== 0) {
+    throw new WorktreeError(`the worktree of ${name} was made from an older commit than ${target.commit.short}; pass the commit its brief named with --commit`);
   }
   return { name, base: target.commit.sha, worktree, tree: join(worktree, target.prefix), top: target.top };
 }
@@ -179,17 +227,19 @@ export async function discardChanges(branch: FixBranch): Promise<void> {
   await must(branch.worktree, ['clean', '-q', '-f', '-d'], 'could not remove new files');
 }
 
-/** How many commits the branch has on top of where it started. */
+/** How many commits the branch has that the target commit does not. */
 export async function commitsOnBranch(branch: FixBranch): Promise<number> {
-  return Number((await must(branch.worktree, ['rev-list', '--count', `${branch.base}..HEAD`], 'could not count commits')).trim());
+  return Number((await must(branch.top, ['rev-list', '--count', `${branch.base}..refs/heads/${branch.name}`], 'could not count commits')).trim());
 }
 
-/** Removes the worktree. The branch is kept only when it has commits: an empty one is noise. */
+/**
+ * Removes the worktree. The branch is deleted only when it has no commit the
+ * target lacks, so nothing is lost; when that cannot be counted, it is kept.
+ */
 export async function closeFixBranch(branch: FixBranch): Promise<{ kept: boolean }> {
-  const kept = (await commitsOnBranch(branch).catch(() => 0)) > 0;
-  await git(branch.top, ['worktree', 'remove', '--force', branch.worktree]);
-  await rm(branch.worktree, { recursive: true, force: true });
-  await git(branch.top, ['worktree', 'prune']);
+  const kept = (await commitsOnBranch(branch).catch(() => 1)) > 0;
+  await removeWorktree(branch.top, branch.worktree);
+  await rm(claimPath(branch.worktree), { force: true });
   if (!kept) await git(branch.top, ['branch', '-q', '-D', branch.name]);
   return { kept };
 }

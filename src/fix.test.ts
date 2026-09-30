@@ -185,10 +185,44 @@ describe('runFixes', () => {
     expect(git('show', 'minotaur/fixes-abc:other.js')).toBe('run();\n');
   });
 
-  it('refuses an existing branch unless forced', async () => {
-    git('branch', 'minotaur/fix-a1b2c3d4');
-    await expect(run({})).rejects.toThrow('already exists');
+  it('continues an existing branch, skipping what it already fixed, and --force starts it again', async () => {
+    expect((await run({})).results[0]!.status).toBe('fixed');
+    const again = await run({ model: model([]) });
+    expect(again).toMatchObject({ alreadyOnBranch: 1, results: [] });
+    expect(git('rev-list', '--count', 'HEAD..minotaur/fix-a1b2c3d4').trim()).toBe('1');
     expect((await run({ force: true })).results[0]!.status).toBe('fixed');
+    expect(git('rev-list', '--count', 'HEAD..minotaur/fix-a1b2c3d4').trim()).toBe('1');
+  });
+
+  it('merges a newer commit into the branch before fixing', async () => {
+    const second = finding({ fingerprint: 'b2b2b2b2', location: { path: 'other.js', startLine: 1 } });
+    await run({ findings: [finding()], scanned: [finding(), second], rescans: [scanResult([second])] });
+    await writeFile(join(root, 'new.js'), 'added();\n');
+    git('add', '.');
+    git('commit', '-q', '-m', 'newer');
+    const result = await run({
+      findings: [second],
+      // The first rescan is of the branch as it is before this fix, which still has the finding.
+      rescans: [scanResult([second]), scanResult([])],
+      model: model([
+        toolCall('write_file', { path: 'other.js', content: 'safe();\n' }),
+        toolCall('submit_fix', { outcome: 'fixed', summary: 'Safe.' }),
+      ]),
+    });
+    expect(result.results[0]!.status).toBe('fixed');
+    // Both fixes, and the newer commit, are on the branch.
+    expect(git('show', 'minotaur/fix-a1b2c3d4:db.js')).toBe(`${SAFE}\n`);
+    expect(git('show', 'minotaur/fix-a1b2c3d4:other.js')).toBe('safe();\n');
+    expect(git('show', 'minotaur/fix-a1b2c3d4:new.js')).toBe('added();\n');
+  });
+
+  it('stops without losing anything when a newer commit conflicts with the branch', async () => {
+    await run({});
+    await writeFile(join(root, 'db.js'), 'changed differently();\n');
+    git('commit', '-q', '-am', 'conflicting');
+    await expect(run({ model: model([]) })).rejects.toThrow(/cannot take the changes of .*--force/);
+    expect(git('show', 'minotaur/fix-a1b2c3d4:db.js')).toBe(`${SAFE}\n`);
+    expect(git('worktree', 'list')).not.toContain('worktrees');
   });
 
   it('does not commit what no scanner can confirm, unless allowed', async () => {
@@ -448,22 +482,17 @@ describe('batch cap', () => {
     expect(result.stoppedAtCap).toBe(true);
   });
 
-  it('resumes the branch, skipping what it already fixed', async () => {
+  it('continues the branch after a stop, skipping what it already fixed', async () => {
     const first = await batch([false]);
     const done = first.run.results.filter((item) => item.status === 'fixed').length;
     const again = await run({
       findings: files.map(bad),
       branch: 'minotaur/fixes-abc',
-      resume: true,
       model: model(script().slice(done * 2)),
       rescan,
     });
     expect(again.alreadyOnBranch).toBe(done);
     expect(again.results.map((item) => item.status)).toEqual(files.slice(done).map(() => 'fixed'));
     expect(git('rev-list', '--count', 'HEAD..minotaur/fixes-abc').trim()).toBe(String(files.length));
-  });
-
-  it('refuses to resume a branch that is not there', async () => {
-    await expect(run({ resume: true })).rejects.toThrow('no branch minotaur/fix-a1b2c3d4 to resume');
   });
 });

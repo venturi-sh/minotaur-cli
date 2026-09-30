@@ -24,7 +24,7 @@ pnpm minotaur                                   # browse the findings in this re
 pnpm minotaur scan ~/code/shop                  # list findings
 pnpm minotaur triage 3f9a1c2e ~/code/shop       # is this one exploitable?
 pnpm minotaur mark 3f9a1c2e false-positive --reason "Test fixture"
-pnpm minotaur fix 3f9a1c2e                      # fix it on the branch minotaur/fix-3f9a1c2e
+pnpm minotaur fix 3f9a1c2e                      # fix it: one commit on the branch minotaur/fixes
 pnpm minotaur fix --all                         # fix everything scan lists, one commit each
 ```
 
@@ -50,9 +50,12 @@ are hidden. Dependencies are ranked with CISA's exploited list and EPSS scores.
 **Checks.** A model reads the code around a finding and answers exploitable, not exploitable
 or undetermined, and cites the code it used. Each check is capped at 30 steps and $3.
 
-**Fixes.** `fix` never changes your working tree. It makes a git worktree from the scanned commit
-in the cache, and commits each fix on the branch `minotaur/fix-ID`, or `minotaur/fixes-COMMIT`
-for several findings. You review the branch and merge it.
+**Fixes.** `fix` never changes your working tree. It works in a git worktree in the cache and
+commits each fix on one branch, `minotaur/fixes` (or the branch you name with `--branch`), one
+commit per fix. Every run adds to that branch and skips the findings it already has a fix for.
+When you have committed since, your new commit is merged into the branch first; if that merge
+conflicts, Minotaur stops and leaves it to you. `--force` starts the branch again. You review the
+branch and merge it. Until you do, `scan` and the browser show which findings have a fix waiting.
 
 - Code and configuration findings are fixed by the model. It can read and edit files, but not
   credential files, git files, scanner ignore files, lockfiles or Minotaur's own settings.
@@ -72,7 +75,7 @@ is not committed unless you add `--allow-unverified`.
 
 Each finding has the same limits as a check. A run of several fixes also has a cap for the
 whole run, $10 by default (`--max-total-usd`). At the cap, Minotaur asks whether to spend as
-much again. Without a terminal, it stops with exit code 3 and prints the `--resume` command.
+much again. Without a terminal, it stops with exit code 3; the same command again continues.
 
 **Decisions.** `mark` records your own answer in `.minotaur/decisions.yml`. Commit that file
 to share your decisions with your team.

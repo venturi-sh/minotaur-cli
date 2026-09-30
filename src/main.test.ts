@@ -567,11 +567,11 @@ describe('minotaur fix', () => {
     script = fixCalls();
     expect(await main(['fix', sql.id, root, ...sources(), ...model(), '--allow-unverified', '--json'])).toBe(0);
     const run = JSON.parse(stdout);
-    expect(run.branch).toBe(`minotaur/fix-${sql.id}`);
+    expect(run.branch).toBe('minotaur/fixes');
     expect(run.results[0]).toMatchObject({ status: 'committed_unverified', changedFiles: ['routes/login.js'] });
     expect(git('show', `${run.branch}:routes/login.js`)).toContain(SAFE_LINE);
     expect(await readFile(join(root, 'routes', 'login.js'), 'utf8')).toContain(QUERY_LINE);
-    expect(stderr).toContain(`on branch minotaur/fix-${sql.id}`);
+    expect(stderr).toContain('on branch minotaur/fixes');
   });
 
   it('skips a secret without calling the model, and takes several ids', async () => {
@@ -581,15 +581,27 @@ describe('minotaur fix', () => {
     script = fixCalls();
     expect(await main(['fix', secret.id, sql.id, root, ...sources(), ...model(), '--allow-unverified', '--json'])).toBe(1);
     const run = JSON.parse(stdout);
-    expect(run.branch).toMatch(/^minotaur\/fixes-/);
+    expect(run.branch).toBe('minotaur/fixes');
     expect(run.results.map((result: { status: string }) => result.status)).toEqual(['skipped', 'committed_unverified']);
     expect(JSON.stringify(requests)).not.toContain(SECRET);
   });
 
-  it('refuses a branch that exists', async () => {
+  it('commits on another branch with --branch', async () => {
     const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
-    git('branch', `minotaur/fix-${sql.id}`);
-    await expect(main(['fix', sql.id, root, ...sources(), ...model()])).rejects.toThrow('already exists');
+    script = fixCalls();
+    expect(await main(['fix', sql.id, root, ...sources(), ...model(), '--allow-unverified', '--branch', 'security/fixes', '--json'])).toBe(0);
+    expect(JSON.parse(stdout).branch).toBe('security/fixes');
+    expect(git('branch', '--list', 'minotaur/*')).toBe('');
+  });
+
+  it("does not start while an agent's edits wait in the worktree", async () => {
+    const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
+    expect(await main(['brief', sql.id, root, ...sources(), '--fix', '--json'])).toBe(0);
+    const tree = JSON.parse(stdout).tree as string;
+    stdout = '';
+    await writeFile(join(tree, 'routes', 'login.js'), 'in progress\n');
+    await expect(main(['fix', sql.id, root, ...sources(), ...model()])).rejects.toThrow(`uncommitted edits for finding ${sql.id}`);
+    expect(await readFile(join(tree, 'routes', 'login.js'), 'utf8')).toBe('in progress\n');
   });
 });
 
@@ -611,12 +623,12 @@ describe('minotaur fix --all', () => {
     script = fixCalls();
     expect(await main(['fix', '--all', root, ...sources(), ...model(), '--allow-unverified', '--focus', 'noise', '--json'])).toBe(0);
     const run = JSON.parse(stdout);
-    expect(run.branch).toMatch(/^minotaur\/fixes-/);
+    expect(run.branch).toBe('minotaur/fixes');
     expect(run.results.map((result: { finding: { kind: string }; status: string }) => `${result.finding.kind}:${result.status}`).sort()).toEqual([
       'sast:committed_unverified',
       'secret:skipped',
     ]);
-    expect(run.resume).toBeNull();
+    expect(run.continue).toBeNull();
   });
 
   it('leaves out findings a person closed', async () => {
@@ -629,7 +641,7 @@ describe('minotaur fix --all', () => {
     expect(requests).toHaveLength(0);
   });
 
-  it('stops at the cap with exit code 3 when there is no terminal to ask, and says how to resume', async () => {
+  it('stops at the cap with exit code 3 when there is no terminal to ask, and says how to continue', async () => {
     vi.stubEnv('MINOTAUR_PRICE_INPUT_PER_MTOK', '3');
     vi.stubEnv('MINOTAUR_PRICE_OUTPUT_PER_MTOK', '15');
     script = fixCalls();
@@ -637,13 +649,13 @@ describe('minotaur fix --all', () => {
     const run = JSON.parse(stdout);
     expect(run.stoppedAtCap).toBe(true);
     expect(run.results.map((result: { status: string }) => result.status)).toContain('stopped_at_cap');
-    expect(run.resume).toMatch(/^minotaur fix --all .* --commit [0-9a-f]{40} --resume$/);
+    expect(run.continue).toMatch(/^minotaur fix --all .* --commit [0-9a-f]{40}$/);
     expect(requests).toHaveLength(0);
   });
 
   it('rejects flags that contradict each other', async () => {
     await expect(main(['fix', '--all', 'abcd1234', root])).rejects.toThrow('no finding ids');
-    await expect(main(['fix', 'abcd1234', '--resume', '--force'])).rejects.toThrow('use one');
+    await expect(main(['fix', 'abcd1234', '--verify', '--discard'])).rejects.toThrow('use one');
     await expect(main(['fix'])).rejects.toThrow('or --all');
   });
 });
@@ -670,7 +682,7 @@ describe('agent fix loop', () => {
   it('gives a worktree, keeps the edits across briefs, and commits what passes', async () => {
     const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
     const first = await briefFix(sql.id);
-    expect(first.branch).toBe(`minotaur/fix-${sql.id}`);
+    expect(first.branch).toBe('minotaur/fixes');
     expect(first.instructions).toContain('Do not commit');
     expect(first.verify).toContain('--verify');
     const file = join(first.tree, 'routes', 'login.js');
@@ -703,7 +715,7 @@ describe('agent fix loop', () => {
     const sql = (await scanJson()).findings.find((finding) => finding.kind === 'sast')!;
     await briefFix(sql.id);
     expect(await main(['fix', sql.id, root, ...sources(), '--discard'])).toBe(0);
-    expect(stdout).toContain('Removed the worktree and branch');
+    expect(stdout).toContain(`Removed the edits for ${sql.id} and the empty branch minotaur/fixes`);
     expect(git('branch', '--list', 'minotaur/*')).toBe('');
   });
 
@@ -734,15 +746,15 @@ describe('fixes on branches', () => {
     stdout = '';
 
     const after = (await scanJson()).findings as unknown as Array<{ id: string; fix: { branch: string; verified: boolean } | null }>;
-    expect(after.find((finding) => finding.id === sql.id)!.fix).toMatchObject({ branch: `minotaur/fix-${sql.id}`, verified: false });
+    expect(after.find((finding) => finding.id === sql.id)!.fix).toMatchObject({ branch: 'minotaur/fixes', verified: false });
     expect(after.filter((finding) => finding.id !== sql.id).every((finding) => finding.fix === null)).toBe(true);
 
     expect(await main(['scan', root, ...sources()])).toBe(0);
     expect(stdout).toContain('⎇');
-    expect(stdout).toContain(`1 finding has a fix on branch minotaur/fix-${sql.id}, not merged yet`);
-    expect(stdout).toContain(`git merge minotaur/fix-${sql.id}`);
+    expect(stdout).toContain('1 finding has a fix on branch minotaur/fixes, not merged yet');
+    expect(stdout).toContain('git merge minotaur/fixes');
 
-    git('merge', '-q', `minotaur/fix-${sql.id}`);
+    git('merge', '-q', 'minotaur/fixes');
     stdout = '';
     // The report file is unchanged, so the finding is still listed; the fix is merged, so it is no longer pending.
     expect((await scanJson()).findings.every((finding) => (finding as { fix?: unknown }).fix === null)).toBe(true);
