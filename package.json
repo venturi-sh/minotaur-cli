@@ -27,7 +27,7 @@
     "node": ">=22"
   },
   "bin": {
-    "minotaur": "./dist/minotaur.js"
+    "minotaur": "dist/minotaur.js"
   },
   "files": [
     "dist/minotaur.js"
