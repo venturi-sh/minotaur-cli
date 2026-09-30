@@ -62,6 +62,10 @@ export function checkLabel(state: BrowserState, finding: LocalFinding): CheckLab
   if (state.running?.fingerprint === finding.fingerprint) return { text: 'checking', color: ACCENT, running: true };
   const position = queuePosition(state, finding);
   if (position !== null) return { text: `◷ queued #${position}`, color: ACCENT, dim: true };
+  if (state.fixing?.current === finding.id) return { text: 'fixing', color: ACCENT, running: true };
+  // Fixed on a branch outranks the rest: the finding is still in this commit, but the work is done.
+  const fix = state.fixes.get(finding.fingerprint);
+  if (fix?.commit) return { text: '⎇ fix on branch', color: 'green', bold: true };
   // A person's decision outranks the model's answer.
   if (finding.decision?.state === 'confirmed') return { text: '● confirmed', color: 'red', bold: true };
   if (finding.decision) return { text: `✓ ${DECISION_LABEL[finding.decision.state]}`, color: 'green', dim: true };

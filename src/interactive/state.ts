@@ -137,6 +137,8 @@ export function initialState(options: {
   protectedPaths: ReadonlySet<string>;
   model: ModelStatus;
   results?: ReadonlyMap<string, TriageResult> | undefined;
+  /** Fixes on branches that are not merged yet, by fingerprint. */
+  fixes?: ReadonlyMap<string, FixView> | undefined;
   message?: string | null | undefined;
 }): BrowserState {
   return {
@@ -157,7 +159,7 @@ export function initialState(options: {
     queue: [],
     marking: null,
     fixing: null,
-    fixes: new Map(),
+    fixes: new Map(options.fixes ?? []),
     question: null,
     message: options.message ?? null,
   };

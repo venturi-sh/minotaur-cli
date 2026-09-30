@@ -60,6 +60,8 @@ export interface Loaded {
   protectedPaths: ReadonlySet<string>;
   /** Earlier checks that still apply, by fingerprint. */
   results?: ReadonlyMap<string, TriageResult> | undefined;
+  /** Fixes on branches that are not merged yet, by fingerprint. */
+  fixes?: ReadonlyMap<string, FixView> | undefined;
   /** Shown until the first key press, such as where the findings came from. */
   message?: string | null | undefined;
   /** The commit, when it changed since the view opened, such as after a new commit and a rescan. */
@@ -587,7 +589,7 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
             {wide && <Cell width={6} text={finding.kind} dim={!selected} />}
             <Box width={17} flexShrink={0} overflow="hidden">
               {check.running ? (
-                <Spinner label="checking" />
+                <Spinner label={check.text} />
               ) : (
                 <Text wrap="truncate-end" {...styleProps(check)}>
                   {check.text}

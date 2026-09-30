@@ -512,3 +512,41 @@ describe('fixing in the browser', () => {
     await done;
   });
 });
+
+describe('fixes from an earlier run', () => {
+  it('marks a finding fixed on a branch in the list, and shows the change on its page', async () => {
+    const { input, output, screen } = terminal(120, 40);
+    const done = browse(
+      options({
+        loaded: {
+          fixes: new Map([
+            [
+              finding.fingerprint,
+              {
+                status: 'fixed',
+                branch: 'minotaur/fixes-3f9a1c2',
+                commit: 'abc1234def5678'.padEnd(40, '0'),
+                summary: 'Fixed on branch minotaur/fixes-3f9a1c2 by agent:claude, not merged yet.',
+                notes: [],
+                error: null,
+                diff: '-eval(req.query.code);\n+run(codes[req.query.code]);',
+              },
+            ],
+          ]),
+          message: '1 finding has a fix on branch minotaur/fixes-3f9a1c2, not merged yet; merge it to close it.',
+        },
+        input,
+        output,
+      }),
+    );
+    await tick();
+    expect(screen()).toContain('⎇ fix on branch');
+    expect(screen()).toContain('not merged yet; merge it to close it');
+    input.write('\r');
+    await tick();
+    expect(screen()).toContain('by agent:claude');
+    expect(screen()).toContain('+run(codes[req.query.code]);');
+    input.write('q');
+    await done;
+  });
+});

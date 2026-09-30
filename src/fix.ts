@@ -186,6 +186,15 @@ export class Baseline {
     return this.fixedBy.get(finding.fingerprint);
   }
 
+  /** Findings these scanners reported before and no longer report in `findings`. */
+  removedIn(findings: readonly LocalFinding[], scanners: readonly string[]): string[] {
+    const rescanned = new Set(scanners);
+    const now = new Set(findings.map((finding) => finding.fingerprint));
+    return this.findings
+      .filter((finding) => reportedBy(finding).some((tool) => rescanned.has(tool)) && !now.has(finding.fingerprint))
+      .map((finding) => finding.fingerprint);
+  }
+
   /** After `commit`: what these scanners report now is the new normal. */
   accept(findings: readonly LocalFinding[], scanners: readonly string[], commit: string): void {
     const rescanned = new Set(scanners);
@@ -676,7 +685,9 @@ async function verifyAndCommit(
     return { status: 'committed_unverified', extra: { commit } };
   }
   if (!verification.passed) return { status: 'failed', extra: { error: verification.problems.join('; ') } };
-  const commit = await commitFix(branch, changed, commitMessage(finding, submission, progress.model, true));
+  // Every finding the change removes is named, so a later run can show them all as fixed on this branch.
+  const removed = baseline.removedIn(checked.after, verification.scanners);
+  const commit = await commitFix(branch, changed, commitMessage(finding, submission, progress.model, true, removed));
   baseline.accept(checked.after, verification.scanners, commit);
   return { status: 'fixed', extra: { commit } };
 }
@@ -686,7 +697,7 @@ function retryPrompt(verification: Verification): string {
   return [`The fix did not pass. ${ran}`, ...verification.problems.map((problem) => `- ${problem}`), '', 'Your edits are still in the files. Fix the cause, then call submit_fix again.'].join('\n');
 }
 
-function commitMessage(finding: LocalFinding, submission: FixSubmission, by: string, verified: boolean): string {
+function commitMessage(finding: LocalFinding, submission: FixSubmission, by: string, verified: boolean, removed: readonly string[] = []): string {
   const title = finding.title.length > 60 ? `${finding.title.slice(0, 57)}...` : finding.title;
   const scope = isDependency(finding) ? 'deps' : 'security';
   return [
@@ -696,7 +707,7 @@ function commitMessage(finding: LocalFinding, submission: FixSubmission, by: str
     ...(submission.notes.length > 0 ? ['', 'For the reviewer:', ...submission.notes.map((note) => `- ${note}`)] : []),
     ...(verified ? [] : ['', 'Not verified: no scanner that reported this finding could run again.']),
     '',
-    `Minotaur-Finding: ${finding.fingerprint}`,
+    ...[finding.fingerprint, ...removed.filter((fingerprint) => fingerprint !== finding.fingerprint)].map((fingerprint) => `Minotaur-Finding: ${fingerprint}`),
     `Minotaur-Fixed-By: ${by}`,
   ].join('\n');
 }

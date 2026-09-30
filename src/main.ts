@@ -83,7 +83,18 @@ import { agentFixInstructions, renderFixRequest, type EarlierCheck } from './age
 import { protectedReason } from './core/index.js';
 import { planUpgrade } from './upgrade.js';
 import { runFixes, upgradeVersion, verifyAgentFix, type Checkpoint, type FixEvent, type FixResult } from './fix.js';
-import { branchExists, branchName, closeFixBranch, commitDiff, existingFixBranch, fixedOnBranch, openFixBranch, WorktreeError } from './worktree.js';
+import {
+  branchExists,
+  branchName,
+  closeFixBranch,
+  commitDiff,
+  existingFixBranch,
+  fixedOnBranch,
+  openFixBranch,
+  pendingFixes,
+  WorktreeError,
+} from './worktree.js';
+import type { FixView } from './interactive/state.js';
 
 const VERSION = '0.1.0';
 
@@ -505,14 +516,17 @@ async function scan(root: string, values: Values): Promise<number> {
   const noise = open.filter((finding) => finding.focus === 'noise').length - shown.filter((finding) => finding.focus === 'noise').length;
   const annotated = values.json || values.unchecked ? await annotate(where, collected, shown, config, values) : shown;
   const listed = values.unchecked ? annotated.filter((finding) => !hasAnswer(finding)) : annotated;
+  const pending = await pendingFixes(where.top, where.commit.sha);
+  const fixedOnBranches = listed.filter((finding) => pending.has(finding.fingerprint));
 
   if (values.json) {
-    const file = toFindingsFile(root, where.commit.sha, listed, collected.sources, collected.protectedPaths);
+    const withFixes = listed.map((finding) => ({ ...finding, fix: pending.get(finding.fingerprint) ?? null }));
+    const file = toFindingsFile(root, where.commit.sha, withFixes, collected.sources, collected.protectedPaths);
     process.stdout.write(`${JSON.stringify(file, null, 2)}\n`);
     return 0;
   }
   const style = process.stdout.isTTY ? COLOR : PLAIN;
-  process.stdout.write(`\n${renderFindingTable(listed, style, process.stdout.columns ?? 120)}\n\n`);
+  process.stdout.write(`\n${renderFindingTable(listed, style, process.stdout.columns ?? 120, new Set(fixedOnBranches.map((finding) => finding.fingerprint)))}\n\n`);
   const belowFocus = open.length - shown.length - noise;
   const focusNotes = [
     ...(closed > 0 ? [`${closed} marked false positive, accepted risk or fixed (--all shows them)`] : []),
@@ -523,6 +537,11 @@ async function scan(root: string, values: Values): Promise<number> {
   if (answered > 0) focusNotes.push(`${answered} already checked not shown (--unchecked hides them)`);
   process.stdout.write(`${renderSummary(listed, collected.findings.length - severe.length, collected.ignored, focusNotes)}\n`);
   process.stdout.write(style.dim(`On ${describeCommit(where.commit)}.\n`));
+  if (fixedOnBranches.length > 0) {
+    const branches = [...new Set(fixedOnBranches.map((finding) => pending.get(finding.fingerprint)!.branch))];
+    process.stdout.write(`${describeBranchFixes(fixedOnBranches.length, branches)}\n`);
+    for (const branch of branches) process.stdout.write(style.dim(`  git log -p ${where.commit.short}..${branch}    then    git merge ${branch}\n`));
+  }
   if (listed.some((finding) => finding.kind === 'sca' || finding.kind === 'sast')) {
     process.stdout.write(style.dim('Run "minotaur triage ID" to check whether a finding is exploitable.\n'));
   }
@@ -562,8 +581,11 @@ async function interactive(root: string, values: Values): Promise<number> {
     const reused = await loadChecks(checkCache, scopeOf(where), tree, collected.findings, model ? identityOf(model) : null, protectedPaths);
     const earlierResults = new Map([...reused].map(([fingerprint, check]) => [fingerprint, check.result]));
     for (const result of earlierResults.values()) reusedResults.add(result);
+    reporter.step('Looking for fixes on branches');
+    const onBranches = await fixesOnBranches(where, collected.findings);
     const notes = [
       ...targetNotes(where),
+      ...(onBranches.fixes.size > 0 ? [describeBranchFixes(onBranches.fixes.size, onBranches.branches)] : []),
       ...(collected.cachedAt ? [`From the scan ${describeAge(Date.now() - collected.cachedAt)}; press r to scan again.`] : []),
       ...(reused.size > 0 ? [`${reused.size} earlier check${reused.size === 1 ? '' : 's'} still appl${reused.size === 1 ? 'ies' : 'y'}.`] : []),
     ];
@@ -572,6 +594,7 @@ async function interactive(root: string, values: Values): Promise<number> {
       ignored: collected.ignored,
       protectedPaths,
       results: earlierResults,
+      fixes: onBranches.fixes,
       message: notes.length > 0 ? notes.join(' ') : null,
       commit: commitLabel(where),
     };
@@ -659,6 +682,45 @@ async function interactive(root: string, values: Values): Promise<number> {
     }
   }
   return 0;
+}
+
+interface BranchFixes {
+  /** By fingerprint, for the findings of this scan. */
+  fixes: Map<string, FixView>;
+  /** The branches they are on, newest first. */
+  branches: string[];
+}
+
+/**
+ * Fixes that are committed on `minotaur/` branches but not in the scanned
+ * commit. The scan still reports these findings, since the code it scanned has
+ * them; this is how a later run knows the work is done and waits for a merge.
+ */
+async function fixesOnBranches(where: Target, findings: readonly LocalFinding[]): Promise<BranchFixes> {
+  const pending = await pendingFixes(where.top, where.commit.sha);
+  const fixes = new Map<string, FixView>();
+  const branches: string[] = [];
+  const diffs = new Map<string, string>();
+  for (const finding of findings) {
+    const fix = pending.get(finding.fingerprint);
+    if (!fix) continue;
+    if (!diffs.has(fix.commit)) diffs.set(fix.commit, await commitDiff(where.top, fix.commit).catch(() => ''));
+    if (!branches.includes(fix.branch)) branches.push(fix.branch);
+    fixes.set(finding.fingerprint, {
+      status: fix.verified ? 'fixed' : 'committed_unverified',
+      branch: fix.branch,
+      commit: fix.commit,
+      summary: `Fixed on branch ${fix.branch}${fix.by ? ` by ${fix.by}` : ''}, not merged yet.`,
+      notes: [],
+      error: null,
+      diff: diffs.get(fix.commit) || null,
+    });
+  }
+  return { fixes, branches };
+}
+
+function describeBranchFixes(count: number, branches: readonly string[]): string {
+  return `${count} finding${count === 1 ? ' has a fix' : 's have fixes'} on ${branches.length === 1 ? `branch ${branches[0]}` : `${branches.length} branches`}, not merged yet; merge ${branches.length === 1 ? 'it' : 'them'} to close ${count === 1 ? 'it' : 'them'}.`;
 }
 
 function commitLabel(where: Target): string {

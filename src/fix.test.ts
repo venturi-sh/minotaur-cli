@@ -362,6 +362,10 @@ describe('dependency fixes', () => {
     expect(result.results.map((item) => item.status)).toEqual(['fixed', 'fixed']);
     expect(result.results[1]!.summary).toContain(`commit ${result.results[0]!.commit!.slice(0, 7)}`);
     expect(git('rev-list', '--count', 'HEAD..minotaur/fixes-abc').trim()).toBe('1');
+    // The one commit names both findings, so a later run shows both as fixed on the branch.
+    const message = git('log', '-1', '--format=%B', 'minotaur/fixes-abc');
+    expect(message).toContain(`Minotaur-Finding: ${lodash().fingerprint}`);
+    expect(message).toContain(`Minotaur-Finding: ${other.fingerprint}`);
   });
 });
 
