@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
-import { EXPLOIT_PROMPT_VERSION, Workspace, isReusable } from './agent/index.js';
+import { AGENT_PROMPT_VERSION, EXPLOIT_PROMPT_VERSION, Workspace, isReusable } from './agent/index.js';
 import { assessmentInputSchema, type AssessmentInput } from './core/index.js';
 import { z } from 'zod';
 
@@ -73,7 +73,16 @@ export function checkCacheDir(cache: string): string {
   return join(cache, 'checks');
 }
 
-/** Keeps a succeeded check. Anything else is not worth reusing, and a check that read nothing cannot be verified later. */
+/** A verdict submitted by an agent in the editor, rather than by a model. */
+export function isAgentResult(result: Pick<TriageResult, 'model' | 'promptVersion'>): boolean {
+  return result.promptVersion === AGENT_PROMPT_VERSION && (result.model === 'agent' || result.model.startsWith('agent:'));
+}
+
+/**
+ * Keeps a succeeded check. A model's check that read nothing cannot be verified
+ * later, so it is not kept. An agent's verdict has no record of what it read,
+ * and is kept for its own commit only.
+ */
 export async function saveCheck(
   dir: string,
   scope: CheckScope,
@@ -82,7 +91,8 @@ export async function saveCheck(
   identity: CheckIdentity,
   now = Date.now(),
 ): Promise<boolean> {
-  if (result.status !== 'succeeded' || inputs.length === 0) return false;
+  if (result.status !== 'succeeded') return false;
+  if (!isAgentResult(result) && inputs.length === 0) return false;
   await writeEntry(dir, { format: FORMAT, repo: scope.repo, commit: scope.commit, effort: identity.effort, inputs: [...inputs], createdAt: now, result });
   return true;
 }
@@ -97,7 +107,7 @@ export async function loadChecks(
   scope: CheckScope,
   tree: string,
   findings: readonly LocalFinding[],
-  identity: CheckIdentity,
+  identity: CheckIdentity | null,
   protectedPaths: ReadonlySet<string>,
 ): Promise<Map<string, CachedCheck>> {
   const folder = repositoryDir(dir, scope.repo);
@@ -106,10 +116,12 @@ export async function loadChecks(
   const suits = (entry: Entry | null, fingerprint: string): entry is Entry =>
     entry !== null &&
     entry.result.finding.fingerprint === fingerprint &&
-    entry.result.model === identity.model &&
-    entry.effort === identity.effort &&
-    entry.result.promptVersion === EXPLOIT_PROMPT_VERSION &&
-    !touchesProtected(entry, protectedPaths);
+    !touchesProtected(entry, protectedPaths) &&
+    (isAgentResult(entry.result) ||
+      (identity !== null &&
+        entry.result.model === identity.model &&
+        entry.effort === identity.effort &&
+        entry.result.promptVersion === EXPLOIT_PROMPT_VERSION));
 
   const others = new Map<string, Array<{ path: string; label: string }>>();
   if (scope.commit) {
@@ -149,6 +161,11 @@ export async function loadChecks(
     // The newest check first: it is the most likely to still apply, and the best answer when it does.
     for (const { entry, miss } of entries.sort((a, b) => b.entry.createdAt - a.entry.createdAt)) {
       workspace ??= await Workspace.open(tree, { denied: [...protectedPaths] });
+      // An agent verdict has nothing to re-check against, so it stays on its own commit.
+      if (isAgentResult(entry.result) || !identity) {
+        misses.add(miss);
+        continue;
+      }
       const current = { promptVersion: EXPLOIT_PROMPT_VERSION, modelId: identity.model };
       const previous = { status: entry.result.status, promptVersion: entry.result.promptVersion, model: entry.result.model, inputs: entry.inputs };
       if (!(await isReusable(previous, current, workspace))) {

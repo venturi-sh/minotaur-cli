@@ -298,6 +298,73 @@ describe('minotaur scan', () => {
   });
 });
 
+describe('agent verdicts', () => {
+  it('briefs a finding, checks the answer, and then hides it', async () => {
+    const first = commitAll('first');
+    const scanned = await scanJson();
+    const code = scanned.findings.find((finding) => finding.kind === 'sast')!;
+    const secret = scanned.findings.find((finding) => finding.kind === 'secret')!;
+
+    expect(await main(['brief', code.id, root, ...sources(), '--json'])).toBe(0);
+    const brief = JSON.parse(stdout);
+    expect(brief.tree).toBe(root);
+    expect(brief.commit.short).toBe(first);
+    expect(brief.instructions).toContain('exploitable');
+    expect(brief.instructions).toContain('untrusted data');
+    expect(brief.submit).toContain(`verdict ${code.id}`);
+    expect(brief.verdict.properties.exploitability).toBeTruthy();
+
+    const file = join(root, 'verdict.json');
+    await writeFile(file, JSON.stringify(verdict));
+    stdout = '';
+    expect(await main(['verdict', code.id, root, ...sources(), '--file', file, '--json', '--agent', 'cursor'])).toBe(0);
+    expect(JSON.parse(stdout)).toMatchObject({ exploitability: 'exploitable', downgraded: false, model: 'agent:cursor', rejectedEvidence: [] });
+
+    stdout = '';
+    expect(await main(['scan', root, ...sources(), '--json', '--unchecked'])).toBe(0);
+    expect(JSON.parse(stdout).findings.some((finding: { id: string }) => finding.id === code.id)).toBe(false);
+
+    stdout = '';
+    const again = await scanJson();
+    expect(again.findings.find((finding) => finding.id === code.id)).toMatchObject({
+      triageable: true,
+      check: { exploitability: 'exploitable', by: 'agent:cursor' },
+    });
+
+    await writeFile(file, JSON.stringify({ ...verdict, evidence: [{ path: 'routes/login.js', startLine: 2, endLine: 2, quote: 'not the line' }] }));
+    stdout = '';
+    expect(await main(['verdict', code.id, root, ...sources(), '--file', file, '--json'])).toBe(0);
+    expect(JSON.parse(stdout)).toMatchObject({ exploitability: 'undetermined', downgraded: true });
+
+    await writeFile(file, '{');
+    stdout = '';
+    expect(await main(['verdict', code.id, root, ...sources(), '--file', file])).toBe(1);
+    expect(JSON.parse(stdout).problems[0]).toMatch(/not JSON/);
+
+    await writeFile(file, JSON.stringify({ exploitability: 'nope' }));
+    stdout = '';
+    expect(await main(['verdict', code.id, root, ...sources(), '--file', file])).toBe(1);
+    expect(JSON.parse(stdout).problems.join('\n')).toMatch(/exploitability/);
+
+    await writeFile(file, JSON.stringify(verdict));
+    stdout = '';
+    expect(await main(['verdict', secret.id, root, ...sources(), '--file', file])).toBe(1);
+    expect(JSON.parse(stdout).problems[0]).toMatch(/secret/);
+  });
+
+  it('points at the clean copy when the working tree has changes', async () => {
+    commitAll('first');
+    const { findings } = await scanJson();
+    const code = findings.find((finding) => finding.kind === 'sast')!;
+    await writeFile(join(root, 'notes.txt'), 'changed\n');
+    stdout = '';
+    expect(await main(['brief', code.id, root, ...sources(), '--json'])).toBe(0);
+    const brief = JSON.parse(stdout);
+    expect(brief.tree).not.toBe(root);
+    expect(brief.tree).toContain(brief.commit.sha);
+  });
+});
+
 describe('minotaur triage', () => {
   it('investigates with a self-hosted model and never sends the secret', async () => {
     const { findings } = await scanJson();

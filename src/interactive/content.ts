@@ -273,6 +273,7 @@ export function resultLines(result: TriageResult, width: number): Line[] {
     lines.push(blank);
     para(`${count} citation${count === 1 ? ' was' : 's were'} dropped because the code did not match.`, { dim: true });
   }
+  para(`Answered by ${result.model}.`, { dim: true });
   const tokens = `${result.inputTokens.toLocaleString('en-US')} in / ${result.outputTokens.toLocaleString('en-US')} out tokens`;
   const cost = result.costUsd > 0 ? ` · $${result.costUsd.toFixed(2)}` : '';
   lines.push(blank);

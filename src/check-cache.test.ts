@@ -140,6 +140,14 @@ describe('check cache', () => {
     expect((await load(null)).size).toBe(0);
   });
 
+  it('keeps an agent verdict that read nothing, and only on its own commit', async () => {
+    const agent = check({ model: 'agent:cursor', promptVersion: 'agent-v1', filesRead: [] });
+    expect(await saveCheck(dir, on(A), agent, [], { model: 'agent:cursor', effort: null })).toBe(true);
+    const found = await loadChecks(dir, on(A), root, [finding], null, new Set());
+    expect(found.get(finding.fingerprint)?.result.model).toBe('agent:cursor');
+    expect((await load(B)).size).toBe(0);
+  });
+
   it('keeps only succeeded checks that read something', async () => {
     expect(await saveCheck(dir, on(A), check({ status: 'failed' }), inputs, IDENTITY)).toBe(false);
     expect(await saveCheck(dir, on(A), check({ status: 'skipped_budget' }), inputs, IDENTITY)).toBe(false);

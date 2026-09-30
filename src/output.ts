@@ -10,7 +10,7 @@ import { z } from 'zod';
 
 import { decisionSchema, isClosed } from './decisions.js';
 import type { LocalFinding, SourceOutcome } from './sources.js';
-import type { TriageResult } from './triage.js';
+import { refusalFor, type TriageResult } from './triage.js';
 
 export interface Style {
   bold(text: string): string;
@@ -160,7 +160,7 @@ export function renderTriageResult(result: TriageResult, style: Style): string {
     const count = result.rejectedEvidence.length;
     lines.push('', style.dim(`${count} citation${count === 1 ? ' was' : 's were'} dropped because the code did not match.`));
   }
-  lines.push('', style.dim(usageLine(result)));
+  lines.push('', style.dim(`Answered by ${result.model}.`), style.dim(usageLine(result)));
   return lines.join('\n');
 }
 
@@ -168,6 +168,15 @@ export function usageLine(result: Pick<TriageResult, 'steps' | 'inputTokens' | '
   const tokens = `${result.inputTokens.toLocaleString('en-US')} input and ${result.outputTokens.toLocaleString('en-US')} output tokens`;
   const cost = result.costUsd > 0 ? `, $${result.costUsd.toFixed(2)}` : '';
   return `${result.steps} step${result.steps === 1 ? '' : 's'}, ${tokens}${cost}, ${result.model}`;
+}
+
+function ageOf(ms: number): string {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return 'less than a minute ago';
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  return `${Math.floor(hours / 24)} days ago`;
 }
 
 function indent(text: string): string[] {
@@ -188,12 +197,57 @@ export const findingsFileSchema = z.object({
       epss: z.number().optional(),
       kev: z.boolean().optional(),
       decision: decisionSchema.optional(),
+      /** True when the finding can be checked, or the reason it cannot. */
+      triageable: z.union([z.literal(true), z.string()]).optional(),
+      /** An earlier exploitability answer, or null when there is none. */
+      check: z
+        .object({
+          exploitability: z.string(),
+          confidence: z.number().nullable(),
+          by: z.string(),
+          age: z.string(),
+        })
+        .nullable()
+        .optional(),
     }),
   ),
   /** Files with a detected secret, including ones whose finding was filtered out of `findings`. */
   protectedPaths: z.array(z.string()).default([]),
 });
 export type FindingsFile = z.infer<typeof findingsFileSchema>;
+
+export interface RecordedCheck {
+  exploitability: string;
+  confidence: number | null;
+  by: string;
+  age: string;
+}
+
+/** A finding plus whether it can be checked, and any answer already on record. */
+export type CheckedFinding = LocalFinding & {
+  triageable: true | string;
+  check: RecordedCheck | null;
+};
+
+/** Adds whether each finding can be checked, and any answer already on record. */
+export function withChecks(
+  findings: readonly LocalFinding[],
+  protectedPaths: ReadonlySet<string>,
+  checks: ReadonlyMap<string, { result: TriageResult; createdAt: number }>,
+  now = Date.now(),
+): CheckedFinding[] {
+  return findings.map((finding) => {
+    const cached = checks.get(finding.fingerprint);
+    const answer = cached?.result.status === 'succeeded' ? cached.result.exploitability : null;
+    return {
+      ...finding,
+      triageable: refusalFor(finding, protectedPaths) ?? true,
+      check: answer
+        ? { exploitability: answer, confidence: cached!.result.confidence, by: cached!.result.model, age: ageOf(now - cached!.createdAt) }
+        : null,
+    };
+  });
+}
 
 export function toFindingsFile(
   root: string,

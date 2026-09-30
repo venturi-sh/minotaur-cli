@@ -3,13 +3,15 @@
  *
  *   minotaur scan [PATH]            list findings from the configured sources
  *   minotaur triage ID [PATH]       decide whether one finding is exploitable
+ *   minotaur brief ID [PATH]        the commit, the files to read, and how to answer
+ *   minotaur verdict ID [PATH]      store an answer an agent worked out itself
  *   minotaur mark ID STATE [PATH]   record a person's decision about a finding
  *
  * Results go to stdout and everything else to stderr, so `--json` output can
  * be piped or redirected without progress mixed into it.
  */
 
-import { realpath, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -31,6 +33,7 @@ import {
   renderSummary,
   renderTriageResult,
   toFindingsFile,
+  withChecks,
 } from './output.js';
 import { cacheDir } from './managed.js';
 import { describeAge, readCachedScan, scanCacheDir, scanKey, writeCachedScan } from './scan-cache.js';
@@ -57,7 +60,7 @@ import {
   type TriageLimits,
   type TriageResult,
 } from './triage.js';
-import { checkCacheDir, loadChecks, saveCheck, type CachedCheck, type CheckScope } from './check-cache.js';
+import { checkCacheDir, loadChecks, saveCheck, type CachedCheck, type CheckIdentity, type CheckScope } from './check-cache.js';
 import {
   DECISIONS_FILE,
   DECISION_LABEL,
@@ -72,6 +75,7 @@ import {
   type Decision,
 } from './decisions.js';
 import { CommitError, describeCommit, resolveTarget, stillCommitted, targetNotes, treeFor, type Target } from './commit.js';
+import { agentIdentity, buildBrief, reviewVerdict } from './review.js';
 
 const VERSION = '0.1.0';
 
@@ -80,7 +84,9 @@ const HELP = `minotaur ${VERSION}
 Usage:
   minotaur [options]                      Browse the findings here and check them one at a time
   minotaur scan [PATH] [options]          List findings from the configured sources
-  minotaur triage ID [PATH] [options]     Decide whether one finding is exploitable
+  minotaur triage ID [PATH] [options]     Ask a model whether one finding is exploitable
+  minotaur brief ID [PATH] [options]      What to read, and how to judge one finding
+  minotaur verdict ID [PATH] [options]    Store an answer you worked out yourself
   minotaur mark ID DECISION [PATH]        Record your own decision about a finding:
                                           false-positive, accepted-risk, fixed, confirmed,
                                           or open to remove it
@@ -106,7 +112,22 @@ scan:
                          likely, maybe (the default) or noise. Style and correctness
                          rules and code in tests are rated noise; see "Focus" in the README.
   --all                  Show every finding, the noise too (the same as --focus noise)
-  --json                 Write the findings as JSON, which "triage --findings" accepts
+  --json                 Write the findings as JSON, which "triage --findings" accepts.
+                         Each finding has "triageable" (true, or why it cannot be
+                         checked) and "check" (an earlier answer, or null).
+  --unchecked            Hide findings that already have an answer
+
+To find exploitable vulnerabilities without a model key, an agent does this:
+  1. minotaur scan [PATH] --json --unchecked --focus likely
+  2. For each finding whose "triageable" is true:
+       minotaur brief ID [PATH] --json
+     Read code only in the "tree" directory. "instructions" say how to judge it,
+     and "verdict" is the JSON shape of the answer.
+  3. minotaur verdict ID [PATH] --json    with that JSON on stdin, or --file PATH
+     Exit code 1 and a "problems" array means the JSON was rejected: fix it and
+     submit again. "downgraded": true, or a non-empty "rejectedEvidence", means
+     the quotes did not match the files: fix the quotes and submit again.
+  4. minotaur scan [PATH] --json    is the report. "check.exploitability" is the answer.
 
 triage:
   --findings FILE        Read findings from "scan --json" output instead of re-running sources
@@ -121,6 +142,17 @@ triage:
                          A check is reused on the commit it was made on, and on a later
                          commit while every file it read and search it ran stay the same.
   --json                 Write the result as JSON
+
+brief:
+  --json                 Write the brief as JSON: commit, tree, finding, instructions,
+                         the verdict schema, and the command to submit
+  --findings FILE        Read findings from "scan --json" instead of scanning
+
+verdict:
+  --file PATH            Read the verdict JSON from a file instead of stdin
+  --agent NAME           Who answered, recorded as agent:NAME (default agent)
+  --json                 Write the stored answer as JSON
+  --findings FILE        Read findings from "scan --json" instead of scanning
 
 mark:
   --reason TEXT          Why, for the people who review the decision
@@ -157,6 +189,9 @@ const OPTIONS = {
   'max-tokens': { type: 'string' },
   'continue-from': { type: 'string' },
   reason: { type: 'string' },
+  unchecked: { type: 'boolean' },
+  file: { type: 'string' },
+  agent: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'v' },
 } as const;
@@ -200,7 +235,19 @@ export async function main(argv: readonly string[]): Promise<number> {
     if (extra.length > 0) throw new UsageError('mark takes a finding id, a decision and at most one path');
     return mark(id, state, await repoRoot(path), values);
   }
-  throw new UsageError(`unknown command "${command}"; expected scan, triage or mark`);
+  if (command === 'brief') {
+    const [id, path, ...extra] = rest;
+    if (!id) throw new UsageError('brief needs a finding id; run "minotaur scan --json" to list them');
+    if (extra.length > 0) throw new UsageError('brief takes a finding id and at most one path');
+    return brief(id, await repoRoot(path), values);
+  }
+  if (command === 'verdict') {
+    const [id, path, ...extra] = rest;
+    if (!id) throw new UsageError('verdict needs a finding id; run "minotaur brief ID --json" first');
+    if (extra.length > 0) throw new UsageError('verdict takes a finding id and at most one path');
+    return verdict(id, await repoRoot(path), values);
+  }
+  throw new UsageError(`unknown command "${command}"; expected scan, triage, brief, verdict or mark`);
 }
 
 /** Where the command was typed. Package scripts run from the package, and record the real place in INIT_CWD. */
@@ -367,23 +414,27 @@ async function scan(root: string, values: Values): Promise<number> {
   const closed = severe.length - open.length;
   const shown = open.filter((finding) => focusRank(finding.focus ?? 'maybe') >= focusRank(floor));
   const noise = open.filter((finding) => finding.focus === 'noise').length - shown.filter((finding) => finding.focus === 'noise').length;
+  const annotated = values.json || values.unchecked ? await annotate(where, collected, shown, config, values) : shown;
+  const listed = values.unchecked ? annotated.filter((finding) => !hasAnswer(finding)) : annotated;
 
   if (values.json) {
-    const file = toFindingsFile(root, where.commit?.sha ?? null, shown, collected.sources, collected.protectedPaths);
+    const file = toFindingsFile(root, where.commit?.sha ?? null, listed, collected.sources, collected.protectedPaths);
     process.stdout.write(`${JSON.stringify(file, null, 2)}\n`);
     return 0;
   }
   const style = process.stdout.isTTY ? COLOR : PLAIN;
-  process.stdout.write(`\n${renderFindingTable(shown, style, process.stdout.columns ?? 120)}\n\n`);
+  process.stdout.write(`\n${renderFindingTable(listed, style, process.stdout.columns ?? 120)}\n\n`);
   const belowFocus = open.length - shown.length - noise;
   const focusNotes = [
     ...(closed > 0 ? [`${closed} marked false positive, accepted risk or fixed (--all shows them)`] : []),
     ...(noise > 0 ? [`${noise} hidden as likely noise (--all shows them)`] : []),
     ...(belowFocus > 0 ? [`${belowFocus} below --focus ${floor} not shown`] : []),
   ];
-  process.stdout.write(`${renderSummary(shown, collected.findings.length - severe.length, collected.ignored, focusNotes)}\n`);
+  const answered = values.unchecked ? annotated.length - listed.length : 0;
+  if (answered > 0) focusNotes.push(`${answered} already checked not shown (--unchecked hides them)`);
+  process.stdout.write(`${renderSummary(listed, collected.findings.length - severe.length, collected.ignored, focusNotes)}\n`);
   if (where.commit) process.stdout.write(style.dim(`On ${describeCommit(where.commit)}.\n`));
-  if (shown.some((finding) => finding.kind === 'sca' || finding.kind === 'sast')) {
+  if (listed.some((finding) => finding.kind === 'sca' || finding.kind === 'sast')) {
     process.stdout.write(style.dim('Run "minotaur triage ID" to check whether a finding is exploitable.\n'));
   }
   return 0;
@@ -419,9 +470,7 @@ async function interactive(root: string, values: Values): Promise<number> {
     protectedPaths = new Set(collected.protectedPaths);
     tree = collected.tree;
     reporter.step('Looking for earlier checks that still apply');
-    const reused = model
-      ? await loadChecks(checkCache, scopeOf(where), tree, collected.findings, identityOf(model), protectedPaths)
-      : new Map<string, CachedCheck>();
+    const reused = await loadChecks(checkCache, scopeOf(where), tree, collected.findings, model ? identityOf(model) : null, protectedPaths);
     const earlierResults = new Map([...reused].map(([fingerprint, check]) => [fingerprint, check.result]));
     for (const result of earlierResults.values()) reusedResults.add(result);
     const notes = [
@@ -502,11 +551,34 @@ function triageLimits(values: Values, config: Config): TriageLimits {
   return limits;
 }
 
-async function triage(id: string, root: string, values: Values): Promise<number> {
-  const { config } = await loadConfig(root);
-  const model = resolveModel(modelFlags(values), config, process.env);
-  const limits = triageLimits(values, config);
+async function annotate(
+  where: Target,
+  collected: Gathered,
+  findings: readonly LocalFinding[],
+  config: Config,
+  values: Values,
+) {
+  const protectedPaths = new Set(collected.protectedPaths);
+  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), collected.tree, findings, configuredIdentity(config, values), protectedPaths);
+  return withChecks(findings, protectedPaths, checks);
+}
 
+function hasAnswer(finding: LocalFinding): boolean {
+  const check = (finding as { check?: { exploitability: string } | null }).check;
+  return check != null;
+}
+
+function configuredIdentity(config: Config, values: Values): CheckIdentity | null {
+  try {
+    return identityOf(resolveModel(modelFlags(values), config, process.env));
+  } catch {
+    return null;
+  }
+}
+
+/** The finding, the tree to read, and the files a check must not open. */
+async function openFinding(id: string, root: string, values: Values) {
+  const { config } = await loadConfig(root);
   const file = values.findings ? await readFindingsFile(fromInvocation(values.findings)) : null;
   // Findings from "scan --json" belong to the commit they were scanned on.
   const where = await target(root, values.commit ?? file?.commit ?? undefined);
@@ -515,11 +587,17 @@ async function triage(id: string, root: string, values: Values): Promise<number>
     info(`The findings file is from commit ${file.commit.slice(0, 7)}, so its line numbers may not match ${where.commit.short}.`);
   }
   const gathered = file ? { ...file, tree: await treeFor(where, cacheDir()) } : await gather(where, values, config);
-  const { protectedPaths: listed, tree } = gathered;
   // Decisions may have changed since a findings file was written, so they are read again.
   const findings = file ? applyDecisions(file.findings, await loadDecisions(root)) : gathered.findings;
-  const protectedPaths = liftProtected([...listed, ...secretPaths(findings)], findings);
-  const finding = resolveFinding(findings, id);
+  const protectedPaths = liftProtected([...(file ? file.protectedPaths : gathered.protectedPaths), ...secretPaths(findings)], findings);
+  return { config, where, tree: gathered.tree, protectedPaths, finding: resolveFinding(findings, id) };
+}
+
+async function triage(id: string, root: string, values: Values): Promise<number> {
+  const { config } = await loadConfig(root);
+  const model = resolveModel(modelFlags(values), config, process.env);
+  const limits = triageLimits(values, config);
+  const { where, tree, protectedPaths, finding } = await openFinding(id, root, values);
   const refusal = refusalFor(finding, protectedPaths);
   if (refusal) throw new Error(refusal);
   const continueFrom = values['continue-from'];
@@ -624,6 +702,63 @@ async function mark(id: string, stateName: string, root: string, values: Values)
   if (!reason) info('Add --reason TEXT next time, so reviewers know why.');
   info(`Commit ${DECISIONS_FILE} to share the decision with the team.`);
   return 0;
+}
+
+/** `minotaur brief ID`: the commit, where to read it, and how to judge the finding. */
+async function brief(id: string, root: string, values: Values): Promise<number> {
+  const opened = await openFinding(id, root, values);
+  const checks = await loadChecks(
+    checkCacheDir(cacheDir()),
+    scopeOf(opened.where),
+    opened.tree,
+    [opened.finding],
+    configuredIdentity(opened.config, values),
+    opened.protectedPaths,
+  );
+  const earlier = checks.get(opened.finding.fingerprint)?.result;
+  const submit = ['minotaur', 'verdict', opened.finding.id, root, ...(values.commit ? ['--commit', values.commit] : []), '--json'].join(' ');
+  const built = buildBrief({
+    finding: opened.finding,
+    tree: opened.tree,
+    commit: opened.where.commit,
+    submit,
+    ...(earlier?.status === 'succeeded' && earlier.exploitability && earlier.rationale ? { earlier } : {}),
+  });
+  process.stdout.write(`${JSON.stringify(built, null, 2)}\n`);
+  return 0;
+}
+
+/** `minotaur verdict ID`: check an agent's answer against the files and keep it. */
+async function verdict(id: string, root: string, values: Values): Promise<number> {
+  const opened = await openFinding(id, root, values);
+  const text = values.file ? await readFile(fromInvocation(values.file), 'utf8') : await readStdin();
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({ problems: [`verdict is not JSON: ${(error as Error).message}`] }, null, 2)}\n`);
+    return 1;
+  }
+  const by = agentIdentity(values.agent);
+  const reviewed = await reviewVerdict({
+    finding: opened.finding,
+    tree: opened.tree,
+    protectedPaths: opened.protectedPaths,
+    raw,
+    by,
+  });
+  if ('problems' in reviewed) {
+    process.stdout.write(`${JSON.stringify({ problems: reviewed.problems }, null, 2)}\n`);
+    return 1;
+  }
+  await saveCheck(checkCacheDir(cacheDir()), scopeOf(opened.where), reviewed.result, [], by);
+  return writeTriageResult(reviewed.result, values);
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 function writeTriageResult(result: TriageResult, values: Values): number {

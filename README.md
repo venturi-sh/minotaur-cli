@@ -24,7 +24,9 @@ pnpm minotaur mark 3f9a1c2e false-positive --reason "Test fixture"
 In the browser, press `t` to check a finding, `m` to mark it, `a` to show hidden findings, `r`
 to scan again and `q` to quit. The footer lists the other keys.
 
-`minotaur --help` lists every option.
+`minotaur --help` lists every option. It is also what an agent should read. The loop is
+`scan --json --unchecked`, then `brief ID --json`, then `verdict ID --json`. No model key is
+needed: the agent reads the code and submits the answer itself.
 
 ## How it works
 
