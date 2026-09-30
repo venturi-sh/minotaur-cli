@@ -16,6 +16,7 @@
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import vm from 'node:vm';
 
 import { isSensitiveFile, type AssessmentInput } from '../core/index.js';
 
@@ -226,9 +227,25 @@ export class Workspace {
   }
 
   async grep(pattern: string, options: GrepOptions = {}): Promise<{ matches: GrepMatch[]; truncated: boolean }> {
-    let regex: RegExp;
+    // Compile and test inside a timed vm so a pathological pattern cannot block
+    // the event loop (ReDoS). The pattern never reaches RegExp in this frame.
+    let testLine: (line: string) => boolean;
     try {
-      regex = new RegExp(pattern, options.ignoreCase ? 'i' : '');
+      const sandbox: { pattern: string; flags: string; re?: RegExp; line: string; hit: boolean } = {
+        pattern,
+        flags: options.ignoreCase ? 'i' : '',
+        line: '',
+        hit: false,
+      };
+      vm.createContext(sandbox);
+      new vm.Script('re = new RegExp(pattern, flags)').runInContext(sandbox, { timeout: 100 });
+      const run = new vm.Script('hit = re.test(line)');
+      testLine = (line: string) => {
+        sandbox.line = line;
+        sandbox.hit = false;
+        run.runInContext(sandbox, { timeout: 50 });
+        return sandbox.hit;
+      };
     } catch (error) {
       throw new WorkspaceAccessError(`invalid pattern: ${(error as Error).message}`);
     }
@@ -254,7 +271,7 @@ export class Workspace {
         // Long lines are minified bundles, and a pathological pattern against
         // one is the easiest way to stall the event loop.
         if (line.length > 2_000) continue;
-        if (!regex.test(line)) continue;
+        if (!testLine(line)) continue;
         matches.push({ path: rel, line: index + 1, text: line.trim().slice(0, 200) });
         if (matches.length >= this.limits.maxGrepMatches) {
           truncated = true;
