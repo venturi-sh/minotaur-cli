@@ -72,7 +72,7 @@ export interface Decided {
 
 export interface BrowseOptions {
   root: string;
-  /** The commit looked at, such as "3f9a1c2 Fix the login redirect", or null outside git. */
+  /** The commit looked at, such as "3f9a1c2 Fix the login redirect". */
   commit: string | null;
   /** Gathers the findings while the loading screen shows its progress. `rescan` is set when the person asks for a new scan. */
   load: (reporter: ScanReporter, options: { rescan: boolean }) => Promise<Loaded>;

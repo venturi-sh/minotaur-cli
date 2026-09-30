@@ -5,7 +5,12 @@ Everything runs on your machine.
 
 ## Install
 
-Needs Node 22 and pnpm 10.
+Needs Node 22, pnpm 10 and git. Minotaur only scans a git repository with at least one
+commit. For a folder without git, make a snapshot first:
+
+```bash
+git init && git add -A && git commit -m snapshot
+```
 
 ```bash
 pnpm install

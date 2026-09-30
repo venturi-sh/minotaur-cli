@@ -4,9 +4,6 @@
  * the files git ignores too (a secret there still protects the file). Entries
  * also expire, because a scanner's vulnerability database moves on even when
  * the code does not.
- *
- * Only scans of a commit are cached: elsewhere there is no cheap way to tell
- * that a file changed.
  */
 
 import { spawn } from 'node:child_process';
@@ -51,8 +48,8 @@ const entrySchema = z.object({
 });
 
 /**
- * A digest of everything the scan result depends on, or null when there is
- * no commit to tie it to. `tree` is where the scan runs, as `treeFor` gives it.
+ * A digest of everything the scan result depends on, or null when git cannot
+ * list the ignored files. `tree` is where the scan runs, as `treeFor` gives it.
  */
 export async function scanKey(
   target: Target,
@@ -60,7 +57,6 @@ export async function scanKey(
   sources: readonly SourceConfig[],
   includeIgnored: boolean,
 ): Promise<string | null> {
-  if (!target.commit || !target.top) return null;
   const hash = createHash('sha256');
   const { repo, copy, prefix } = target;
   hash.update(JSON.stringify({ format: FORMAT, repo, commit: target.commit.sha, copy, prefix, includeIgnored, sources, tools: pinnedTools() }));

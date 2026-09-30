@@ -92,15 +92,6 @@ describe('scan cache', () => {
     expect(await keyOf(REPORT, false, 'HEAD')).toBe(key);
   });
 
-  it('has no key outside a git work tree', async () => {
-    const plain = await realpath(await mkdtemp(join(tmpdir(), 'minotaur-plain-')));
-    try {
-      expect(await scanKey(await resolveTarget(plain, undefined), plain, REPORT, false)).toBeNull();
-    } finally {
-      await rm(plain, { recursive: true, force: true });
-    }
-  });
-
   it('reads back what it wrote, without secret snippets, for this user only', async () => {
     const key = (await keyOf())!;
     expect(await writeCachedScan(cache, repo, key, result(), 1_000)).toBe(true);

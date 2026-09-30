@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -72,8 +72,8 @@ describe('check cache', () => {
     await rm(join(dir, '..'), { recursive: true, force: true });
   });
 
-  const on = (commit: string | null) => ({ repo: root, commit });
-  const load = (commit: string | null, identity: CheckIdentity = IDENTITY, protectedPaths = new Set<string>()) =>
+  const on = (commit: string) => ({ repo: root, commit });
+  const load = (commit: string, identity: CheckIdentity = IDENTITY, protectedPaths = new Set<string>()) =>
     loadChecks(dir, on(commit), root, [finding], identity, protectedPaths);
 
   it('reuses a check on its own commit without looking at the files again, for this user only', async () => {
@@ -133,11 +133,17 @@ describe('check cache', () => {
     expect((await load(A, { ...IDENTITY, model: 'openai-compatible:other' })).size).toBe(0);
   });
 
-  it('always looks at the files again without a commit', async () => {
-    await saveCheck(dir, on(null), check(), inputs, IDENTITY);
-    expect((await load(null)).size).toBe(1);
+  it('carries checks kept without a commit only while what they read is unchanged', async () => {
+    await saveCheck(dir, on(A), check(), inputs, IDENTITY);
+    const [folder] = await readdir(dir);
+    const file = `${finding.fingerprint}.json`;
+    const entry = JSON.parse(await readFile(join(dir, folder!, A, file), 'utf8'));
+    await rm(join(dir, folder!, A), { recursive: true });
+    await mkdir(join(dir, folder!, 'no-commit'));
+    await writeFile(join(dir, folder!, 'no-commit', file), JSON.stringify({ ...entry, commit: null }));
+    expect((await load(B)).get(finding.fingerprint)?.carriedFrom).toBe('an earlier run');
     await writeFile(join(root, 'app.js'), 'eval(sanitize(req.query.code));\n');
-    expect((await load(null)).size).toBe(0);
+    expect((await load(C)).size).toBe(0);
   });
 
   it('keeps an agent verdict that read nothing, and only on its own commit', async () => {

@@ -26,8 +26,7 @@ export interface Commit {
 export interface Target {
   /** The directory the person named. Caches are kept per this directory. */
   repo: string;
-  /** Null outside a git repository, or in one without commits. */
-  commit: Commit | null;
+  commit: Commit;
   /** True when the commit is HEAD. */
   head: boolean;
   /** True when the working tree has changes, including untracked files, that the commit does not have. */
@@ -35,25 +34,25 @@ export interface Target {
   /** True when the working tree is not the commit, so a clean copy is scanned instead. */
   copy: boolean;
   /** The repository's top directory, and where `repo` sits in it. */
-  top: string | null;
+  top: string;
   prefix: string;
 }
 
 export class CommitError extends Error {}
 
+/** Every run looks at one commit, so a folder without one needs a snapshot first. */
+const COMMIT_HINT = 'git add -A && git commit -m snapshot';
+
 /** Works out which commit to look at. Quick: only `git` metadata is read. */
 export async function resolveTarget(repo: string, ref: string | undefined): Promise<Target> {
   const top = (await git(repo, ['rev-parse', '--show-toplevel']))?.trim();
-  if (!top) {
-    if (ref) throw new CommitError(`${repo} is not in a git repository, so --commit does not apply`);
-    return { repo, commit: null, head: false, uncommitted: false, copy: false, top: null, prefix: '' };
-  }
+  if (!top) throw new CommitError(`${repo} is not in a git repository. To scan it, make one first:\n  git init && ${COMMIT_HINT}`);
   const prefix = (await git(repo, ['rev-parse', '--show-prefix']))?.trim() ?? '';
   const head = (await git(top, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']))?.trim() || null;
   const sha = (await git(top, ['rev-parse', '-q', '--verify', `${ref ?? 'HEAD'}^{commit}`]))?.trim() || null;
   if (!sha) {
     if (ref) throw new CommitError(`"${ref}" is not a commit in ${top}`);
-    return { repo, commit: null, head: false, uncommitted: false, copy: false, top, prefix };
+    throw new CommitError(`${top} has no commits yet. To scan it, make one first:\n  ${COMMIT_HINT}`);
   }
   const [short = sha.slice(0, 7), subject = ''] = ((await git(top, ['log', '-1', '--format=%h%x00%s', sha])) ?? '').trim().split('\0');
   const status = await git(top, statusArgs(prefix));
@@ -64,7 +63,7 @@ export async function resolveTarget(repo: string, ref: string | undefined): Prom
 
 /** The directory to scan and read: the working tree, or a clean copy of the commit made on first use. */
 export async function treeFor(target: Target, cache: string): Promise<string> {
-  if (!target.copy || !target.commit || !target.top) return target.repo;
+  if (!target.copy) return target.repo;
   const copies = join(cache, 'trees', createHash('sha256').update(target.top).digest('hex').slice(0, 16));
   const dir = join(copies, target.commit.sha);
   if (await isDirectory(dir)) {
@@ -93,7 +92,6 @@ export async function treeFor(target: Target, cache: string): Promise<string> {
 /** True while the working tree still matches the commit, so a check that read it describes the commit. */
 export async function stillCommitted(target: Target): Promise<boolean> {
   if (target.copy) return true;
-  if (!target.top) return false;
   return (await git(target.top, statusArgs(target.prefix))) === '';
 }
 
@@ -113,7 +111,6 @@ export function describeCommit(commit: Commit): string {
 
 /** What a person should know about where the findings come from, or nothing when it is the working tree as it is. */
 export function targetNotes(target: Target): string[] {
-  if (!target.commit) return target.top ? ['This repository has no commits yet, so the files are scanned as they are.'] : [];
   if (!target.copy) return [];
   const why = target.head
     ? `Uncommitted changes are left out: this is ${target.commit.short} as committed.`

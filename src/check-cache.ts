@@ -20,8 +20,6 @@ import type { LocalFinding } from './sources.js';
 import { triageResultSchema, type TriageResult } from './triage.js';
 
 const FORMAT = 2;
-/** Where checks made without a commit are kept. They are always verified before reuse. */
-const NO_COMMIT = 'no-commit';
 
 /** Which model setup a check came from. A different model or effort may answer differently. */
 export interface CheckIdentity {
@@ -36,10 +34,10 @@ export interface CachedCheck {
   carriedFrom?: string;
 }
 
-/** Where checks are looked up: the repository as the person named it, and the commit, if any. */
+/** Where checks are looked up: the repository as the person named it, and the commit. */
 export interface CheckScope {
   repo: string;
-  commit: string | null;
+  commit: string;
   /** True when the tree is a clean copy of the commit, which has fewer files than the working tree. */
   copy?: boolean;
 }
@@ -49,6 +47,7 @@ const entrySchema = () =>
   z.object({
     format: z.literal(FORMAT),
     repo: z.string(),
+    /** Null in checks kept before every run had a commit. They can still be carried over. */
     commit: z.string().nullable(),
     effort: z.string().nullable(),
     inputs: z.array(assessmentInputSchema),
@@ -111,7 +110,7 @@ export async function loadChecks(
   protectedPaths: ReadonlySet<string>,
 ): Promise<Map<string, CachedCheck>> {
   const folder = repositoryDir(dir, scope.repo);
-  const here = scope.commit ?? NO_COMMIT;
+  const here = scope.commit;
   const found = new Map<string, CachedCheck>();
   const suits = (entry: Entry | null, fingerprint: string): entry is Entry =>
     entry !== null &&
@@ -124,21 +123,19 @@ export async function loadChecks(
         entry.result.promptVersion === EXPLOIT_PROMPT_VERSION));
 
   const others = new Map<string, Array<{ path: string; label: string }>>();
-  if (scope.commit) {
-    for (const finding of findings) {
-      const entry = await readEntry(join(folder, here, `${finding.fingerprint}.json`), scope.repo);
-      if (suits(entry, finding.fingerprint)) found.set(finding.fingerprint, { result: entry.result, createdAt: entry.createdAt });
-    }
+  for (const finding of findings) {
+    const entry = await readEntry(join(folder, here, `${finding.fingerprint}.json`), scope.repo);
+    if (suits(entry, finding.fingerprint)) found.set(finding.fingerprint, { result: entry.result, createdAt: entry.createdAt });
   }
   const wanted = new Set(findings.map((finding) => finding.fingerprint).filter((fingerprint) => !found.has(fingerprint)));
   if (wanted.size === 0) return found;
 
   // A check that did not carry over to this commit will not next time either, so it is only tried once.
   const missesPath = join(folder, here, `misses-${scope.copy ? 'copy' : 'tree'}.json`);
-  const misses = new Set(scope.commit ? await readMisses(missesPath) : []);
+  const misses = new Set(await readMisses(missesPath));
   const missed = misses.size;
   for (const name of await readdir(folder).catch(() => [] as string[])) {
-    if (name === here && scope.commit) continue;
+    if (name === here) continue;
     const files = name.endsWith('.json') ? [name] : await readdir(join(folder, name)).catch(() => [] as string[]);
     for (const file of files) {
       const fingerprint = file.slice(0, -'.json'.length);
@@ -174,13 +171,11 @@ export async function loadChecks(
       }
       const carriedFrom = entry.commit ? `commit ${entry.commit.slice(0, 7)}` : 'an earlier run';
       found.set(fingerprint, { result: entry.result, createdAt: entry.createdAt, carriedFrom });
-      if (scope.commit) {
-        await writeEntry(dir, { ...entry, format: FORMAT, repo: scope.repo, commit: scope.commit }).catch(() => {});
-      }
+      await writeEntry(dir, { ...entry, format: FORMAT, repo: scope.repo, commit: scope.commit }).catch(() => {});
       break;
     }
   }
-  if (scope.commit && misses.size > missed) await writeMisses(missesPath, misses).catch(() => {});
+  if (misses.size > missed) await writeMisses(missesPath, misses).catch(() => {});
   return found;
 }
 
@@ -209,9 +204,9 @@ function touchesProtected(entry: Entry, protectedPaths: ReadonlySet<string>): bo
   );
 }
 
-async function writeEntry(dir: string, entry: Entry): Promise<void> {
+async function writeEntry(dir: string, entry: Entry & { commit: string }): Promise<void> {
   // Checks quote code, so they are readable by this user only.
-  const folder = join(repositoryDir(dir, entry.repo), entry.commit ?? NO_COMMIT);
+  const folder = join(repositoryDir(dir, entry.repo), entry.commit);
   await mkdir(folder, { recursive: true, mode: 0o700 });
   const path = join(folder, `${entry.result.finding.fingerprint}.json`);
   const staging = `${path}.${process.pid}.tmp`;

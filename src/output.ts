@@ -186,7 +186,7 @@ function indent(text: string): string[] {
 export const findingsFileSchema = z.object({
   version: z.literal(1),
   root: z.string(),
-  /** The commit scanned, or null outside git. Missing in files from before commits were recorded. */
+  /** The commit scanned. Null or missing in files from before every run had a commit. */
   commit: z.string().nullable().default(null),
   findings: z.array(
     findingSchema.omit({ raw: true }).extend({
@@ -251,7 +251,7 @@ export function withChecks(
 
 export function toFindingsFile(
   root: string,
-  commit: string | null,
+  commit: string,
   findings: readonly LocalFinding[],
   sources: readonly SourceOutcome[],
   protectedPaths: readonly string[],

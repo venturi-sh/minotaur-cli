@@ -73,7 +73,7 @@ function commitAll(message: string): string {
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
   git('init', '-q');
   git('add', '.');
-  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', message);
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', message);
   return git('log', '-1', '--format=%h').trim();
 }
 
@@ -128,6 +128,8 @@ beforeEach(async () => {
     }),
   );
 
+  // Every run looks at a commit.
+  commitAll('fixture');
   cache = await mkdtemp(join(tmpdir(), 'minotaur-e2e-cache-'));
   vi.stubEnv('MINOTAUR_CACHE_DIR', cache);
   script = [];
@@ -166,6 +168,17 @@ const verdict = {
 };
 
 describe('minotaur scan', () => {
+  it('refuses a folder without git, or without a commit, and says how to make one', async () => {
+    const plain = await realpath(await mkdtemp(join(tmpdir(), 'minotaur-plain-')));
+    try {
+      await expect(main(['scan', plain, ...sources()])).rejects.toThrow(/not in a git repository[\s\S]*git init && git add -A && git commit/);
+      execFileSync('git', ['init', '-q'], { cwd: plain });
+      await expect(main(['scan', plain, ...sources()])).rejects.toThrow(/has no commits yet[\s\S]*git add -A && git commit/);
+    } finally {
+      await rm(plain, { recursive: true, force: true });
+    }
+  });
+
   it('lists findings from report files with repository paths', async () => {
     expect(await main(['scan', root, ...sources()])).toBe(0);
     expect(stdout).toContain('routes/login.js:2');

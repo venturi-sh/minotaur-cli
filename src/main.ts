@@ -276,9 +276,9 @@ async function target(root: string, ref: string | undefined): Promise<Target> {
   }
 }
 
-/** "/repo at commit 3f9a1c2 (Fix the login redirect)", or just the directory without a commit. */
+/** "/repo at commit 3f9a1c2 (Fix the login redirect)". */
 function describeTarget(target: Target): string {
-  return target.commit ? `${target.repo} at ${describeCommit(target.commit)}` : target.repo;
+  return `${target.repo} at ${describeCommit(target.commit)}`;
 }
 
 /** Says which commit a `scan` or `triage` looks at, before anything else. */
@@ -354,7 +354,7 @@ function decided(collected: Gathered, decisions: ReadonlyMap<string, Decision>):
 }
 
 async function scanned(target: Target, values: Values, config: Config, reporter: ScanReporter): Promise<Gathered> {
-  if (target.copy && target.commit) reporter.step(`Copying ${target.commit.short} out of git`);
+  if (target.copy) reporter.step(`Copying ${target.commit.short} out of git`);
   const tree = await treeFor(target, cacheDir());
   reporter.step('Working out which scanners apply');
   const sources = await sourcesFor(target, tree, values, config);
@@ -385,14 +385,14 @@ async function scanned(target: Target, values: Values, config: Config, reporter:
 }
 
 function scopeOf(target: Target): CheckScope {
-  return { repo: target.repo, commit: target.commit?.sha ?? null, copy: target.copy };
+  return { repo: target.repo, commit: target.commit.sha, copy: target.copy };
 }
 
 /** Keeps finished checks for this commit, unless the working tree moved away from it while the check ran. */
 function keeper(target: Target, model: ResolvedModel): RunTriageOptions['keep'] {
   const dir = checkCacheDir(cacheDir());
   return async (result, inputs) => {
-    if (target.commit && !(await stillCommitted(target))) return;
+    if (!(await stillCommitted(target))) return;
     await saveCheck(dir, scopeOf(target), result, inputs, identityOf(model));
   };
 }
@@ -418,7 +418,7 @@ async function scan(root: string, values: Values): Promise<number> {
   const listed = values.unchecked ? annotated.filter((finding) => !hasAnswer(finding)) : annotated;
 
   if (values.json) {
-    const file = toFindingsFile(root, where.commit?.sha ?? null, listed, collected.sources, collected.protectedPaths);
+    const file = toFindingsFile(root, where.commit.sha, listed, collected.sources, collected.protectedPaths);
     process.stdout.write(`${JSON.stringify(file, null, 2)}\n`);
     return 0;
   }
@@ -433,7 +433,7 @@ async function scan(root: string, values: Values): Promise<number> {
   const answered = values.unchecked ? annotated.length - listed.length : 0;
   if (answered > 0) focusNotes.push(`${answered} already checked not shown (--unchecked hides them)`);
   process.stdout.write(`${renderSummary(listed, collected.findings.length - severe.length, collected.ignored, focusNotes)}\n`);
-  if (where.commit) process.stdout.write(style.dim(`On ${describeCommit(where.commit)}.\n`));
+  process.stdout.write(style.dim(`On ${describeCommit(where.commit)}.\n`));
   if (listed.some((finding) => finding.kind === 'sca' || finding.kind === 'sast')) {
     process.stdout.write(style.dim('Run "minotaur triage ID" to check whether a finding is exploitable.\n'));
   }
@@ -533,8 +533,8 @@ async function interactive(root: string, values: Values): Promise<number> {
   return 0;
 }
 
-function commitLabel(where: Target): string | null {
-  return where.commit ? `${where.commit.short} ${where.commit.subject}`.trim() : null;
+function commitLabel(where: Target): string {
+  return `${where.commit.short} ${where.commit.subject}`.trim();
 }
 
 function modelFlags(values: Values) {
@@ -583,7 +583,7 @@ async function openFinding(id: string, root: string, values: Values) {
   // Findings from "scan --json" belong to the commit they were scanned on.
   const where = await target(root, values.commit ?? file?.commit ?? undefined);
   announce(where);
-  if (file?.commit && where.commit && file.commit !== where.commit.sha) {
+  if (file?.commit && file.commit !== where.commit.sha) {
     info(`The findings file is from commit ${file.commit.slice(0, 7)}, so its line numbers may not match ${where.commit.short}.`);
   }
   const gathered = file ? { ...file, tree: await treeFor(where, cacheDir()) } : await gather(where, values, config);
