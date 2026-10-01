@@ -1,6 +1,6 @@
 {
   "name": "minotaur-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Runs your security scanners, hides the noise, asks a model whether a finding is exploitable, and fixes it on a branch.",
   "license": "MIT",
   "keywords": [
