@@ -171,8 +171,16 @@ describe('minotaur', () => {
 
       browse.mockClear();
       process.chdir(root);
-      expect(await main(['.'])).toBe(0);
-      expect(browse).toHaveBeenCalledWith(expect.objectContaining({ root }));
+      // pnpm records where the test was started, and `.` follows that rather than the directory just entered.
+      const typedIn = process.env['INIT_CWD'];
+      delete process.env['INIT_CWD'];
+      try {
+        expect(await main(['.'])).toBe(0);
+        expect(browse).toHaveBeenCalledWith(expect.objectContaining({ root }));
+      } finally {
+        if (typedIn === undefined) delete process.env['INIT_CWD'];
+        else process.env['INIT_CWD'] = typedIn;
+      }
     } finally {
       process.chdir(cwd);
       restore();
