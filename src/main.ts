@@ -7,7 +7,7 @@
  *   minotaur verdict ID [PATH]      store an answer an agent worked out itself
  *   minotaur fix ID... [PATH]       fix findings on a new branch, checked by a rescan
  *   minotaur mark ID STATE [PATH]   record a person's decision about a finding
- *   minotaur auth login             sign in to the Claude Console, when no API key is set
+ *   minotaur auth login [PROVIDER]  sign in to Anthropic or OpenAI, when no API key is set
  *
  * Results go to stdout and everything else to stderr, so `--json` output can
  * be piped or redirected without progress mixed into it.
@@ -23,7 +23,7 @@ import { FOCUS_LEVELS, SEVERITIES, focusRank, severityRank, type Focus, type Sev
 
 import { advisoryCacheDir, lookupAdvisories, rankFindings } from './advisories.js';
 
-import { authStatusText, consoleLogin, consoleLogout } from './auth.js';
+import { chooseAuthProvider, consoleLogin, consoleLogout, formatAuthStatus, openAILogin, openAILogout, parseAuthProvider } from './auth.js';
 import { loadConfig, sourceFromFlag, type Config, type SourceConfig } from './config.js';
 import { browse, type Loaded } from './interactive/app.js';
 import type { ScanReporter } from './interactive/loading.js';
@@ -123,9 +123,10 @@ Usage:
   minotaur mark ID DECISION [PATH]        Record your own decision about a finding:
                                           false-positive, accepted-risk, fixed, confirmed,
                                           or open to remove it
-  minotaur auth login                     Sign in to the Claude Console. Used when no API key is set
-  minotaur auth status                    Show whether a key or that login would be used
-  minotaur auth logout                    Forget the Console login
+  minotaur auth login [PROVIDER]          Sign in. PROVIDER is anthropic or openai.
+                                          With no PROVIDER, choose one from the list.
+  minotaur auth status [PROVIDER]         Show whether a key or that login would be used
+  minotaur auth logout [PROVIDER]         Forget that login
 
 Minotaur looks at a git repository with at least one commit. If the folder is not one,
 it offers to make a repository and commit a snapshot.
@@ -180,7 +181,8 @@ To fix a finding without a model key, an agent does this:
 
 triage:
   --findings FILE        Read findings from "scan --json" output instead of re-running sources
-  --model PROVIDER:MODEL anthropic:claude-opus-5-5, or openai-compatible:MODEL for a server you run
+  --model PROVIDER:MODEL anthropic:claude-opus-5-5, openai:gpt-5.4, or
+                         openai-compatible:MODEL for a server you run
   --base-url URL         Address of an OpenAI-compatible server, e.g. http://localhost:11434/v1
   --effort LEVEL         Anthropic effort: low, medium, high, xhigh, max (default medium)
   --max-steps N          Model calls allowed (default ${DEFAULT_MAX_STEPS})
@@ -248,18 +250,27 @@ mark:
   false positive no longer keeps its file away from checks.
 
 auth:
-  minotaur auth login        Sign in to the Claude Console with the ant command.
-                             If ant is missing, Minotaur offers to install it.
-                             Triage and fix use that login when no API key is set.
-  --no-browser               Print the address instead of opening a browser
-  minotaur auth status       Show whether an API key or the Console login would be used
-  minotaur auth logout       Forget the Console login. This also logs the ant command out.
+  minotaur auth login anthropic
+                         Sign in to the Claude Console with the ant command.
+                         If ant is missing, Minotaur offers to install it.
+                         Triage and fix use that login when no API key is set.
+  minotaur auth login openai
+                         Ask for an OpenAI API key and store it outside the
+                         repository. This is an API key, not a ChatGPT login.
+  minotaur auth login    Choose a provider from the list, when a terminal can answer.
+  --no-browser           Print the address instead of opening a browser.
+                         Anthropic only.
+  minotaur auth status [PROVIDER]
+                         Show whether an API key or a stored login would be used.
+                         With no PROVIDER, show Anthropic and OpenAI.
+  minotaur auth logout [PROVIDER]
+                         Forget that login. Anthropic logout also logs the ant
+                         command out. An environment key is left as it is.
 
 Environment:
-  ANTHROPIC_API_KEY or MINOTAUR_API_KEY, or a Claude Console login from
-  "minotaur auth login" when neither key is set. MINOTAUR_MODEL, MINOTAUR_BASE_URL,
-  MINOTAUR_CACHE_DIR (where downloaded scanners, the last scans, checks and copies
-  of commits are kept)
+  ANTHROPIC_API_KEY or OPENAI_API_KEY wins over a stored login. MINOTAUR_API_KEY
+  is a fallback for either. MINOTAUR_MODEL, MINOTAUR_BASE_URL, MINOTAUR_CACHE_DIR
+  (where downloaded scanners, the last scans, checks and copies of commits are kept)
 `;
 
 export class UsageError extends Error {}
@@ -1326,17 +1337,44 @@ function info(message: string): void {
   process.stderr.write(`${message}\n`);
 }
 
-/** `minotaur auth`: sign in to the Claude Console, or show what would be used. */
+/** `minotaur auth`: sign in to Anthropic or OpenAI, or show what would be used. */
 async function auth(rest: readonly string[], values: Values): Promise<number> {
-  const [action, ...extra] = rest;
-  if (extra.length > 0) throw new UsageError('auth takes one action: login, status or logout');
+  const [action, providerName, ...extra] = rest;
+  if (extra.length > 0) throw new UsageError('auth takes an action and one provider');
+  const provider = providerName ? checkedProvider(providerName) : undefined;
   if (action === 'status') {
-    process.stdout.write(`${await authStatusText(process.env)}\n`);
+    process.stdout.write(`${await formatAuthStatus(process.env, provider)}\n`);
     return 0;
   }
-  if (action === 'login') return consoleLogin({ noBrowser: values['no-browser'] === true, env: process.env });
-  if (action === 'logout') return consoleLogout();
+  if (action === 'login') {
+    const which = provider ?? (await offeredProvider('Sign in with which provider', action));
+    if (which === 'openai') return openAILogin({ env: process.env });
+    return consoleLogin({ noBrowser: values['no-browser'] === true, env: process.env });
+  }
+  if (action === 'logout') {
+    const which = provider ?? (await offeredProvider('Log out of which provider', action));
+    if (which === 'openai') return openAILogout({ env: process.env });
+    return consoleLogout();
+  }
   throw new UsageError('auth needs an action: login, status or logout');
+}
+
+function checkedProvider(name: string): ReturnType<typeof parseAuthProvider> {
+  try {
+    return parseAuthProvider(name);
+  } catch (error) {
+    throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function offeredProvider(question: string, action: string): Promise<ReturnType<typeof parseAuthProvider>> {
+  try {
+    return await chooseAuthProvider(question);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith('needs a provider')) throw new UsageError(`auth ${action} ${message}`);
+    throw error;
+  }
 }
 
 /** 0 when the command did its job, 1 when it could not, 2 when it was called wrongly. */

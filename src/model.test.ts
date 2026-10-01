@@ -8,7 +8,7 @@ import { resolveModel } from './model.js';
 
 describe('resolveModel', () => {
   it('explains both ways to set up a model when none is configured', async () => {
-    await expect(resolveModel({}, {}, {})).rejects.toThrow(/No model is configured[\s\S]*Ollama[\s\S]*ANTHROPIC_API_KEY[\s\S]*auth login/);
+    await expect(resolveModel({}, {}, {})).rejects.toThrow(/No model is configured[\s\S]*Ollama[\s\S]*ANTHROPIC_API_KEY[\s\S]*OPENAI_API_KEY[\s\S]*auth login/);
   });
 
   it('defaults to the exploit model when only an Anthropic key is present', async () => {
@@ -38,6 +38,7 @@ describe('resolveModel', () => {
 
   it('reports what is missing', async () => {
     await expect(resolveModel({ model: 'anthropic:claude-sonnet-5' }, {}, {})).rejects.toThrow(/needs ANTHROPIC_API_KEY/);
+    await expect(resolveModel({ model: 'openai:gpt-5.4' }, {}, {})).rejects.toThrow(/needs OPENAI_API_KEY/);
     await expect(resolveModel({ model: 'openai-compatible:x' }, {}, {})).rejects.toThrow(/needs the server address/);
     await expect(resolveModel({ model: 'openai-compatible:x', baseUrl: 'http://a/v1', effort: 'high' }, {}, {})).rejects.toThrow(
       /only applies to Anthropic/,
@@ -64,6 +65,27 @@ describe('resolveModel', () => {
 
       const keyed = await resolveModel({}, {}, { ...env, ANTHROPIC_API_KEY: 'sk-ant-api-from-the-env' });
       expect(keyed.destination).toBe('Anthropic API');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses a stored OpenAI key when no API key is set, and an API key instead when one is', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'minotaur-openai-'));
+    const key = 'sk-openai-not-for-the-destination';
+    try {
+      const file = join(dir, 'openai.json');
+      await writeFile(file, JSON.stringify({ api_key: key }));
+      await chmod(file, 0o600);
+      const env = { MINOTAUR_CONFIG_DIR: dir };
+      const signedIn = await resolveModel({}, {}, env);
+      expect(signedIn.spec.id).toBe('openai:gpt-5.4');
+      expect(signedIn.destination).toBe('OpenAI API, signed in');
+      expect(signedIn.destination).not.toContain(key);
+
+      const keyed = await resolveModel({}, {}, { ...env, OPENAI_API_KEY: 'sk-from-the-env' });
+      expect(keyed.destination).toBe('OpenAI API');
+      expect(keyed.spec.id).toBe('openai:gpt-5.4');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

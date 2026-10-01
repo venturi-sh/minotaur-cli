@@ -99,10 +99,19 @@ Use Anthropic with an API key:
 export ANTHROPIC_API_KEY=...
 ```
 
-Or sign in to the Claude Console. That login is used when no API key is set. If `ant` is missing, login offers to install it:
+Or sign in. `minotaur auth login` shows a list of providers. Anthropic uses the Claude Console
+through `ant`, and offers to install `ant` when it is missing. OpenAI asks for an API key and
+stores it outside the repository. An environment key always wins.
 
 ```bash
-minotaur auth login
+minotaur auth login anthropic
+minotaur auth login openai
+```
+
+Or call OpenAI by name:
+
+```bash
+minotaur triage 3f9a1c2e --model openai:gpt-5.4
 ```
 
 Or any server that speaks the OpenAI chat API, such as Ollama:
@@ -112,7 +121,8 @@ minotaur triage 3f9a1c2e --model openai-compatible:qwen3-coder --base-url http:/
 ```
 
 Shared settings go in `.minotaur.yml` at the repository root. API keys go only in environment
-variables. A Console login is stored by the `ant` command, not in the repository.
+variables. A Console login is stored by the `ant` command, and an OpenAI key by
+`minotaur auth login openai`, not in the repository.
 
 ## Safety
 

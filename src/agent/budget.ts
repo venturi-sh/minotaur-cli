@@ -31,6 +31,7 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   'anthropic:claude-haiku-4-5': { inputPerMTok: 1, outputPerMTok: 5 },
   'anthropic:claude-opus-5': { inputPerMTok: 5, outputPerMTok: 25 },
   'anthropic:claude-opus-5-5': { inputPerMTok: 4, outputPerMTok: 20, cacheReadMultiplier: 0.05 },
+  'openai:gpt-5.4': { inputPerMTok: 2.5, outputPerMTok: 15 },
 };
 
 /** Anthropic prices prompt-cache writes (5-minute lifetime) and reads relative to plain input. */

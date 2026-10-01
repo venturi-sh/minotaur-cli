@@ -207,13 +207,16 @@ describe('minotaur', () => {
     vi.stubEnv('MINOTAUR_API_KEY', '');
     vi.stubEnv('ANTHROPIC_PROFILE', '');
     vi.stubEnv('ANTHROPIC_CONFIG_DIR', dir);
+    vi.stubEnv('OPENAI_API_KEY', '');
+    vi.stubEnv('MINOTAUR_CONFIG_DIR', dir);
     stdout = '';
     try {
       expect(await main(['auth', 'status'])).toBe(0);
       expect(stdout).toContain('ada@example.com');
       expect(stdout).not.toContain(token);
       await expect(main(['auth'])).rejects.toThrow(/login, status or logout/);
-      await expect(main(['auth', 'status', 'extra'])).rejects.toThrow(/one action/);
+      await expect(main(['auth', 'status', 'nope'])).rejects.toThrow(/anthropic, openai/);
+      await expect(main(['auth', 'status', 'anthropic', 'extra'])).rejects.toThrow(/one provider/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

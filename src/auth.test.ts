@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { AntMissingError, anthropicConfigDir, authStatusText, consoleLogin, consoleLogout, loadConsoleToken } from './auth.js';
+import { AntMissingError, anthropicConfigDir, authStatusText, chooseAuthProvider, consoleLogin, consoleLogout, formatAuthStatus, loadConsoleToken, minotaurConfigDir, openAILogin, openAILogout } from './auth.js';
 import { OAUTH_BETA } from './agent/model.js';
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -130,7 +130,7 @@ describe('Console login', () => {
       config: { authentication: { type: 'user_oauth' } },
     });
     const env = { ANTHROPIC_CONFIG_DIR: dir };
-    await expect(loadConsoleToken(env, { now: () => NOW })).rejects.toThrow(/minotaur auth login again/);
+    await expect(loadConsoleToken(env, { now: () => NOW })).rejects.toThrow(/minotaur auth login anthropic again/);
     const status = await authStatusText(env, { now: () => NOW });
     expect(status).toContain('This login has expired');
     expect(status).not.toContain(TOKEN);
@@ -204,6 +204,87 @@ describe('Console login', () => {
     expect(await consoleLogout({ run, warn: (message) => warnings.push(message) })).toBe(0);
     expect(run).toHaveBeenCalledWith('ant', ['auth', 'logout']);
     expect(warnings[0]).toMatch(/logs the ant command out/);
+  });
+});
+
+describe('OpenAI login', () => {
+  it('finds the config directory the same way Anthropic does', () => {
+    expect(minotaurConfigDir({ MINOTAUR_CONFIG_DIR: '/override' }, 'linux')).toBe('/override');
+    expect(minotaurConfigDir({ XDG_CONFIG_HOME: '/xdg' }, 'linux')).toBe('/xdg/minotaur');
+    expect(minotaurConfigDir({ HOME: '/home/ada' }, 'darwin')).toBe('/home/ada/.config/minotaur');
+    expect(minotaurConfigDir({}, 'linux')).toBeNull();
+  });
+
+  it('stores the key privately, and status never prints it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'minotaur-openai-auth-'));
+    const key = 'sk-openai-secret';
+    const env = { MINOTAUR_CONFIG_DIR: dir };
+    try {
+      const warnings: string[] = [];
+      expect(await openAILogin({ env, readKey: async () => key, warn: (message) => warnings.push(message) })).toBe(0);
+      expect(warnings).toContain('Signed in to OpenAI.');
+      const file = join(dir, 'openai.json');
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+      expect(await readFile(file, 'utf8')).toContain(key);
+      const status = await formatAuthStatus(env, 'openai');
+      expect(status).toBe('Signed in to OpenAI.');
+      expect(status).not.toContain(key);
+      const both = await formatAuthStatus(env, undefined);
+      expect(both).toContain('OpenAI: Signed in to OpenAI.');
+      expect(both).not.toContain(key);
+      expect(await openAILogout({ env, warn: (message) => warnings.push(message) })).toBe(0);
+      await expect(readFile(file, 'utf8')).rejects.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a key file other users can read', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'minotaur-openai-loose-'));
+    try {
+      const file = join(dir, 'openai.json');
+      await writeFile(file, JSON.stringify({ api_key: 'sk-loose' }));
+      await chmod(file, 0o644);
+      await expect(formatAuthStatus({ MINOTAUR_CONFIG_DIR: dir }, 'openai')).rejects.toThrow(/chmod 600/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('lets you move through the list, and names one when nobody can answer', async () => {
+    const stdin = process.stdin.isTTY;
+    const stderr = process.stderr.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: false });
+    Object.defineProperty(process.stderr, 'isTTY', { configurable: true, value: false });
+    const written: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((text: string | Uint8Array) => {
+      written.push(String(text));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await expect(chooseAuthProvider('Sign in')).rejects.toThrow(/needs a provider: anthropic or openai/);
+      async function* down() {
+        yield '\u001b';
+        yield '[B';
+        yield '\r';
+      }
+      expect(await chooseAuthProvider('Sign in', down())).toBe('openai');
+      expect(written.join('')).toContain('› Anthropic');
+      expect(written.join('')).toContain('OpenAI');
+      async function* stay() {
+        yield '\n';
+      }
+      expect(await chooseAuthProvider('Sign in', stay())).toBe('anthropic');
+      async function* cancel() {
+        yield '\u0003';
+      }
+      await expect(chooseAuthProvider('Sign in', cancel())).rejects.toThrow(/Cancelled/);
+    } finally {
+      process.stderr.write = write;
+      Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: stdin });
+      Object.defineProperty(process.stderr, 'isTTY', { configurable: true, value: stderr });
+    }
   });
 });
 

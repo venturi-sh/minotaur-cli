@@ -203,7 +203,15 @@ describe('model configuration', () => {
 
   it('rejects malformed or unsupported specs', () => {
     expect(() => parseModelSpec('claude')).toThrow(/provider:model/);
-    expect(() => parseModelSpec('openai:gpt-5')).toThrow(/unsupported/);
+    expect(() => parseModelSpec('nope:gpt-5')).toThrow(/unsupported/);
+  });
+
+  it('accepts an OpenAI model and prices the default', () => {
+    expect(parseModelSpec('openai:gpt-5.4')).toEqual({ provider: 'openai', modelId: 'gpt-5.4', id: 'openai:gpt-5.4' });
+    expect(capabilitiesOf(parseModelSpec('openai:gpt-5.4'))).toEqual({ promptCaching: false, effort: false, forcedToolChoice: true });
+    expect(resolvePricing(parseModelSpec('openai:gpt-5.4'))).toEqual({ inputPerMTok: 2.5, outputPerMTok: 15 });
+    expect(describeDestination(parseModelSpec('openai:gpt-5.4'), { apiKey: 'sk-test', signedIn: true })).toBe('OpenAI API, signed in');
+    expect(createModel(parseModelSpec('openai:gpt-5.4'), { apiKey: 'sk-test' })).toBeTruthy();
   });
 
   it('accepts any model on an openai-compatible server, colons in the name included', () => {

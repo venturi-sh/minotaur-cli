@@ -2,10 +2,10 @@
  * Which model triages, and what it costs.
  *
  * `TRIAGE_MODEL` is `provider:model`, so switching provider is configuration
- * rather than code. Two providers exist: Anthropic, and `openai-compatible`,
- * which is any server that speaks the OpenAI chat completions format. That
- * covers Ollama, vLLM, LM Studio, llama.cpp and most internal gateways, so the
- * code can stay on hardware the customer controls.
+ * rather than code. Three providers exist: Anthropic, OpenAI's API, and
+ * `openai-compatible`, which is any server that speaks the OpenAI chat
+ * completions format. That covers Ollama, vLLM, LM Studio, llama.cpp and most
+ * internal gateways, so the code can stay on hardware the customer controls.
  */
 
 import { createAnthropic } from '@ai-sdk/anthropic';
@@ -17,6 +17,9 @@ import { MODEL_PRICING, type ModelPricing } from './budget.js';
 export const DEFAULT_TRIAGE_MODEL = 'anthropic:claude-sonnet-5';
 /** The on-demand check is asked for rarely and acted on directly, so it gets the stronger model. */
 export const DEFAULT_EXPLOIT_MODEL = 'anthropic:claude-opus-5-5';
+/** Used when the only credential is an OpenAI API key. */
+export const DEFAULT_OPENAI_MODEL = 'openai:gpt-5.4';
+const OPENAI_API = 'https://api.openai.com/v1';
 
 /** How much the model thinks and writes per call; Anthropic's `effort` setting. */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -31,7 +34,7 @@ export function parseEffort(value: string | undefined, fallback: Effort, setting
   return raw as Effort;
 }
 
-export const PROVIDERS = ['anthropic', 'openai-compatible'] as const;
+export const PROVIDERS = ['anthropic', 'openai', 'openai-compatible'] as const;
 export type Provider = (typeof PROVIDERS)[number];
 
 export interface ModelSpec {
@@ -58,6 +61,7 @@ export function capabilitiesOf(spec: ModelSpec): ModelCapabilities {
   if (spec.provider === 'anthropic') {
     return { promptCaching: true, effort: true, forcedToolChoice: !NO_FORCED_TOOL_CHOICE.has(spec.id) };
   }
+  if (spec.provider === 'openai') return { promptCaching: false, effort: false, forcedToolChoice: true };
   // Local servers differ in whether they honour tool_choice, and one that
   // ignores it looks exactly like a model answering in prose. Reminding works
   // everywhere.
@@ -113,7 +117,7 @@ export interface ModelConnection {
   authToken?: string | undefined;
   /** Where an `openai-compatible` server listens, such as `http://localhost:11434/v1`. */
   baseURL?: string | undefined;
-  /** True when `authToken` came from a Console login rather than an API key. */
+  /** True when the credential came from a stored login rather than an API key in the environment. */
   signedIn?: boolean | undefined;
 }
 
@@ -129,6 +133,10 @@ export function createModel(spec: ModelSpec, connection: ModelConnection | strin
         : {};
     return createAnthropic({ ...auth, ...(baseURL ? { baseURL } : {}) })(spec.modelId);
   }
+  if (spec.provider === 'openai') {
+    if (!apiKey) throw new Error(`${spec.id} needs an OpenAI API key`);
+    return createOpenAICompatible({ name: 'openai', baseURL: baseURL ?? OPENAI_API, apiKey })(spec.modelId);
+  }
   if (!baseURL) {
     throw new Error(
       `${spec.id} needs the address of the server, for example http://localhost:11434/v1 for Ollama`,
@@ -141,6 +149,10 @@ export function createModel(spec: ModelSpec, connection: ModelConnection | strin
 export function describeDestination(spec: ModelSpec, connection: ModelConnection): string {
   if (spec.provider === 'anthropic') {
     const where = connection.baseURL ? `Anthropic API via ${connection.baseURL}` : 'Anthropic API';
+    return connection.signedIn ? `${where}, signed in` : where;
+  }
+  if (spec.provider === 'openai') {
+    const where = connection.baseURL ? `OpenAI API via ${connection.baseURL}` : 'OpenAI API';
     return connection.signedIn ? `${where}, signed in` : where;
   }
   return connection.baseURL ?? 'an unconfigured server';

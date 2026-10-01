@@ -1,6 +1,10 @@
 /**
- * Claude Console login, stored by `ant auth login`. Minotaur does not run
- * its own OAuth flow: it reads that login and uses it when no API key is set.
+ * Logins Minotaur can use when no API key is in the environment.
+ *
+ * Anthropic is the Claude Console login stored by `ant auth login`. Minotaur
+ * does not run its own OAuth flow: it reads that login and refreshes it.
+ * OpenAI is an API key, asked for by `minotaur auth login openai` and stored
+ * outside the repository. A ChatGPT subscription login is not used.
  */
 
 import { spawn } from 'node:child_process';
@@ -68,11 +72,11 @@ export async function authStatusText(env: Env, options: LoadOptions = {}): Promi
   const variable = env['ANTHROPIC_API_KEY'] ? 'ANTHROPIC_API_KEY' : env['MINOTAUR_API_KEY'] ? 'MINOTAUR_API_KEY' : null;
   if (variable) return `Using ${variable} from the environment.`;
   const stored = await readStored(env, options, false);
-  if (!stored) return 'Not signed in. Run minotaur auth login, or set ANTHROPIC_API_KEY.';
+  if (!stored) return 'Not signed in. Run minotaur auth login anthropic, or set ANTHROPIC_API_KEY.';
   const lines = ['Signed in to the Claude Console.'];
   if (stored.email) lines.push(`Account: ${stored.email}`);
   if (stored.workspaceId) lines.push(`Workspace: ${stored.workspaceId}`);
-  if (stored.expired) lines.push('This login has expired. Run minotaur auth login again.');
+  if (stored.expired) lines.push('This login has expired. Run minotaur auth login anthropic again.');
   return lines.join('\n');
 }
 
@@ -116,6 +120,258 @@ export async function consoleLogout(options: AntCommandOptions = {}): Promise<nu
   return code;
 }
 
+export const AUTH_PROVIDERS = ['anthropic', 'openai'] as const;
+export type AuthProvider = (typeof AUTH_PROVIDERS)[number];
+
+export function parseAuthProvider(name: string): AuthProvider {
+  const provider = name.trim().toLowerCase();
+  if ((AUTH_PROVIDERS as readonly string[]).includes(provider)) return provider as AuthProvider;
+  throw new Error(`provider must be one of ${AUTH_PROVIDERS.join(', ')}, got "${name}"`);
+}
+
+const AUTH_CHOICES: readonly { id: AuthProvider; label: string }[] = [
+  { id: 'anthropic', label: 'Anthropic' },
+  { id: 'openai', label: 'OpenAI' },
+];
+
+/** Shows a list when the command did not name a provider and someone can answer. */
+export async function chooseAuthProvider(title: string, keys?: AsyncIterable<string>): Promise<AuthProvider> {
+  const interactive = keys != null || (Boolean(process.stdin.isTTY) && Boolean(process.stderr.isTTY));
+  if (!interactive) throw new Error(`needs a provider: ${AUTH_PROVIDERS.join(' or ')}`);
+  return readSelection(title, keys ?? stdinKeys(), (text) => process.stderr.write(text));
+}
+
+/** Anthropic, OpenAI, or both when no provider was named. The token and the key are never included. */
+export async function formatAuthStatus(env: Env, provider: AuthProvider | undefined, options: LoadOptions = {}): Promise<string> {
+  if (provider === 'anthropic') return authStatusText(env, options);
+  if (provider === 'openai') return openAIStatusText(env, options);
+  const anthropic = await authStatusText(env, options);
+  const openai = await openAIStatusText(env, options);
+  return `${label('Anthropic', anthropic)}\n${label('OpenAI', openai)}`;
+}
+
+/** Where a stored OpenAI API key is kept. Null when no home directory is available. */
+export function minotaurConfigDir(env: Env, platform: NodeJS.Platform = process.platform): string | null {
+  if (env['MINOTAUR_CONFIG_DIR']) return env['MINOTAUR_CONFIG_DIR'];
+  if (platform === 'win32') {
+    if (env['APPDATA']) return join(env['APPDATA'], 'Minotaur');
+    if (env['USERPROFILE']) return join(env['USERPROFILE'], 'AppData', 'Roaming', 'Minotaur');
+    return null;
+  }
+  if (env['XDG_CONFIG_HOME']) return join(env['XDG_CONFIG_HOME'], 'minotaur');
+  if (env['HOME']) return join(env['HOME'], '.config', 'minotaur');
+  return null;
+}
+
+/** The API key `minotaur auth login openai` stored. Null when there is no stored key. */
+export async function loadOpenAIKey(env: Env, options: LoadOptions = {}): Promise<string | null> {
+  const path = openAIKeyPath(env, options.platform ?? process.platform);
+  if (!path) return null;
+  await assertPrivate(path, options.platform ?? process.platform);
+  const raw = await readJson(path);
+  if (raw === undefined) return null;
+  if (!isRecord(raw) || typeof raw['api_key'] !== 'string' || !raw['api_key']) throw new Error(`${path} has no api_key`);
+  return raw['api_key'];
+}
+
+export interface OpenAICommandOptions {
+  env: Env;
+  warn?: (message: string) => void;
+  /** When set, used instead of the hidden prompt. */
+  readKey?: () => Promise<string>;
+  platform?: NodeJS.Platform;
+}
+
+/** Asks for an OpenAI API key and stores it outside the repository. */
+export async function openAILogin(options: OpenAICommandOptions): Promise<number> {
+  const warn = options.warn ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const variable = options.env['OPENAI_API_KEY'] ? 'OPENAI_API_KEY' : options.env['MINOTAUR_API_KEY'] ? 'MINOTAUR_API_KEY' : null;
+  if (variable) warn(`${variable} is set, so Minotaur keeps using it until you unset it.`);
+  const apiKey = (await (options.readKey ?? (() => readSecret('OpenAI API key: ')))()).trim();
+  if (!apiKey) throw new Error('An API key is required.');
+  const path = openAIKeyPath(options.env, options.platform ?? process.platform);
+  if (!path) throw new Error('No home directory is set, so the OpenAI API key cannot be stored. Set OPENAI_API_KEY instead.');
+  await writeCredentials(path, { api_key: apiKey });
+  warn('Signed in to OpenAI.');
+  return 0;
+}
+
+/** Forgets the stored OpenAI API key. An environment key is left as it is. */
+export async function openAILogout(options: OpenAICommandOptions): Promise<number> {
+  const warn = options.warn ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const path = openAIKeyPath(options.env, options.platform ?? process.platform);
+  let removed = false;
+  if (path) {
+    try {
+      await unlink(path);
+      removed = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  warn(removed ? 'Signed out of OpenAI.' : 'Not signed in to OpenAI.');
+  const variable = options.env['OPENAI_API_KEY'] ? 'OPENAI_API_KEY' : options.env['MINOTAUR_API_KEY'] ? 'MINOTAUR_API_KEY' : null;
+  if (variable) warn(`${variable} is still set, so Minotaur keeps using it.`);
+  return 0;
+}
+
+async function openAIStatusText(env: Env, options: LoadOptions): Promise<string> {
+  const variable = env['OPENAI_API_KEY'] ? 'OPENAI_API_KEY' : env['MINOTAUR_API_KEY'] ? 'MINOTAUR_API_KEY' : null;
+  if (variable) return `Using ${variable} from the environment.`;
+  const key = await loadOpenAIKey(env, options);
+  if (!key) return 'Not signed in. Run minotaur auth login openai, or set OPENAI_API_KEY.';
+  return 'Signed in to OpenAI.';
+}
+
+function openAIKeyPath(env: Env, platform: NodeJS.Platform): string | null {
+  const dir = minotaurConfigDir(env, platform);
+  return dir ? join(dir, 'openai.json') : null;
+}
+
+function label(name: string, text: string): string {
+  const [first, ...rest] = text.split('\n');
+  return [`${name}: ${first}`, ...rest].join('\n');
+}
+
+async function readSelection(title: string, keys: AsyncIterable<string>, write: (text: string) => void): Promise<AuthProvider> {
+  let index = 0;
+  let drawn = 0;
+  const render = () => {
+    if (drawn > 0) write(`\x1b[${drawn}A\x1b[J`);
+    const lines = [title, ...AUTH_CHOICES.map((choice, i) => `${i === index ? '›' : ' '} ${choice.label}`)];
+    write(`${lines.join('\n')}\n`);
+    drawn = lines.length;
+  };
+  const clear = () => {
+    if (drawn > 0) write(`\x1b[${drawn}A\x1b[J`);
+    drawn = 0;
+  };
+  render();
+  let pending = '';
+  for await (const chunk of keys) {
+    pending += chunk;
+    while (pending.length > 0) {
+      const step = takeKey(pending);
+      if (!step) break;
+      pending = step.rest;
+      if (step.action === 'up') index = (index + AUTH_CHOICES.length - 1) % AUTH_CHOICES.length;
+      else if (step.action === 'down') index = (index + 1) % AUTH_CHOICES.length;
+      else if (step.action === 'select') {
+        clear();
+        return AUTH_CHOICES[index]!.id;
+      } else if (step.action === 'cancel') {
+        clear();
+        throw new Error('Cancelled.');
+      }
+      if (step.action === 'up' || step.action === 'down') render();
+    }
+  }
+  clear();
+  throw new Error('Cancelled.');
+}
+
+/** One key, or null when an escape sequence is still incomplete. */
+function takeKey(pending: string): { action: 'up' | 'down' | 'select' | 'cancel' | 'ignore'; rest: string } | null {
+  if (pending.startsWith('\u001b[') || pending.startsWith('\u001bO')) {
+    if (pending.length < 3) return null;
+    const direction = pending[2];
+    const rest = pending.slice(3);
+    if (direction === 'A') return { action: 'up', rest };
+    if (direction === 'B') return { action: 'down', rest };
+    return { action: 'ignore', rest };
+  }
+  if (pending.startsWith('\u001b')) return pending.length === 1 ? null : { action: 'ignore', rest: pending.slice(1) };
+  const rest = pending.slice(1);
+  const char = pending[0];
+  if (char === '\u0003' || char === 'q') return { action: 'cancel', rest };
+  if (char === '\r' || char === '\n') return { action: 'select', rest };
+  return { action: 'ignore', rest };
+}
+
+async function* stdinKeys(): AsyncGenerator<string> {
+  const stdin = process.stdin;
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.setEncoding('utf8');
+  const waiting: string[] = [];
+  let wake: (() => void) | undefined;
+  const onData = (chunk: string) => {
+    waiting.push(chunk);
+    wake?.();
+    wake = undefined;
+  };
+  stdin.on('data', onData);
+  try {
+    while (true) {
+      const next = waiting.shift();
+      if (next !== undefined) {
+        yield next;
+        continue;
+      }
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  } finally {
+    stdin.off('data', onData);
+    if (stdin.isTTY) stdin.setRawMode(false);
+    stdin.pause();
+  }
+}
+
+async function askLine(question: string): Promise<string> {
+  const { createInterface } = await import('node:readline/promises');
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await prompt.question(question);
+  } finally {
+    prompt.close();
+  }
+}
+
+/** Reads one line and does not echo it. */
+async function readSecret(prompt: string): Promise<string> {
+  process.stderr.write(prompt);
+  if (!process.stdin.isTTY) {
+    const line = await askLine('');
+    process.stderr.write('\n');
+    return line;
+  }
+  const stdin = process.stdin;
+  stdin.setRawMode(true);
+  stdin.resume();
+  let value = '';
+  try {
+    return await new Promise((resolve, reject) => {
+      const onData = (chunk: Buffer) => {
+        for (const char of chunk.toString('utf8')) {
+          if (char === '\u0003') {
+            stdin.off('data', onData);
+            process.stderr.write('\n');
+            reject(new Error('Sign-in cancelled.'));
+            return;
+          }
+          if (char === '\r' || char === '\n') {
+            stdin.off('data', onData);
+            process.stderr.write('\n');
+            resolve(value);
+            return;
+          }
+          if (char === '\u007f' || char === '\b') {
+            value = value.slice(0, -1);
+            continue;
+          }
+          if (char >= ' ') value += char;
+        }
+      };
+      stdin.on('data', onData);
+    });
+  } finally {
+    stdin.setRawMode(false);
+    stdin.pause();
+  }
+}
+
 async function readStored(env: Env, options: LoadOptions, refresh: boolean): Promise<Stored | null> {
   const platform = options.platform ?? process.platform;
   const dir = anthropicConfigDir(env, platform);
@@ -139,7 +395,7 @@ async function readStored(env: Env, options: LoadOptions, refresh: boolean): Pro
     return { accessToken: credentials.accessToken, ...base, expired: !fresh && (!clientId || !credentials.refreshToken) };
   }
   if (!clientId || !credentials.refreshToken) {
-    throw new Error('The Console login has expired. Run minotaur auth login again.');
+    throw new Error('The Console login has expired. Run minotaur auth login anthropic again.');
   }
   const baseURL = (config?.baseUrl ?? env['ANTHROPIC_BASE_URL'] ?? DEFAULT_API).replace(/\/$/, '');
   assertSecure(baseURL);
