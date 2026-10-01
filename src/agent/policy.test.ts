@@ -243,6 +243,9 @@ describe('model configuration', () => {
     expect(createModel(local, { baseURL: 'http://gpu.internal:8000/v1' })).toBeTruthy();
     expect(describeDestination(local, { baseURL: 'http://gpu.internal:8000/v1' })).toBe('http://gpu.internal:8000/v1');
     expect(describeDestination(parseModelSpec('anthropic:claude-sonnet-5'), {})).toBe('Anthropic API');
+    expect(describeDestination(parseModelSpec('anthropic:claude-sonnet-5'), { authToken: 'token', signedIn: true })).toBe(
+      'Anthropic API, signed in',
+    );
   });
 
   it('requires a price so the cap can be enforced', () => {

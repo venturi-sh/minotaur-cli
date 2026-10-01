@@ -104,16 +104,30 @@ export function resolvePricing(
   );
 }
 
+/** Sent with a Console OAuth token, on the API call and when refreshing it. */
+export const OAUTH_BETA = 'oauth-2025-04-20';
+
 export interface ModelConnection {
   apiKey?: string | undefined;
+  /** Claude Console access token. Sent as `Authorization: Bearer`, never as `x-api-key`. */
+  authToken?: string | undefined;
   /** Where an `openai-compatible` server listens, such as `http://localhost:11434/v1`. */
   baseURL?: string | undefined;
+  /** True when `authToken` came from a Console login rather than an API key. */
+  signedIn?: boolean | undefined;
 }
 
 export function createModel(spec: ModelSpec, connection: ModelConnection | string): LanguageModel {
-  const { apiKey, baseURL } = typeof connection === 'string' ? { apiKey: connection, baseURL: undefined } : connection;
+  const parsed = typeof connection === 'string' ? { apiKey: connection } : connection;
+  const { apiKey, authToken, baseURL } = parsed;
   if (spec.provider === 'anthropic') {
-    return createAnthropic({ ...(apiKey ? { apiKey } : {}), ...(baseURL ? { baseURL } : {}) })(spec.modelId);
+    // A bearer token must not also send x-api-key. The provider rejects both at once.
+    const auth = authToken
+      ? { authToken, headers: { 'anthropic-beta': OAUTH_BETA } }
+      : apiKey
+        ? { apiKey }
+        : {};
+    return createAnthropic({ ...auth, ...(baseURL ? { baseURL } : {}) })(spec.modelId);
   }
   if (!baseURL) {
     throw new Error(
@@ -125,6 +139,9 @@ export function createModel(spec: ModelSpec, connection: ModelConnection | strin
 
 /** Where the code goes when this model is called, said plainly for the person running it. */
 export function describeDestination(spec: ModelSpec, connection: ModelConnection): string {
-  if (spec.provider === 'anthropic') return connection.baseURL ? `Anthropic API via ${connection.baseURL}` : 'Anthropic API';
+  if (spec.provider === 'anthropic') {
+    const where = connection.baseURL ? `Anthropic API via ${connection.baseURL}` : 'Anthropic API';
+    return connection.signedIn ? `${where}, signed in` : where;
+  }
   return connection.baseURL ?? 'an unconfigured server';
 }

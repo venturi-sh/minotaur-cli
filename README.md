@@ -1,3 +1,12 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-light.png">
+  <img alt="Minotaur" src="assets/logo-dark.png" width="440">
+</picture>
+
+</div>
+
 # minotaur
 
 Run your security scanners, hide the noise, ask a model whether a finding is exploitable, and
@@ -11,8 +20,8 @@ Needs Node 22 and git.
 npm install -g minotaur-cli     # installs the minotaur command
 ```
 
-Minotaur only scans a git repository with at least one commit. For a folder without git, make a
-snapshot first:
+Minotaur only scans a git repository with at least one commit. If the folder is not one, it
+offers to make a repository and commit a snapshot. You can also do that yourself:
 
 ```bash
 git init && git add -A && git commit -m snapshot
@@ -84,10 +93,16 @@ to share your decisions with your team.
 
 ## Model
 
-Use Anthropic:
+Use Anthropic with an API key:
 
 ```bash
 export ANTHROPIC_API_KEY=...
+```
+
+Or sign in to the Claude Console. That login is used when no API key is set. If `ant` is missing, login offers to install it:
+
+```bash
+minotaur auth login
 ```
 
 Or any server that speaks the OpenAI chat API, such as Ollama:
@@ -97,7 +112,7 @@ minotaur triage 3f9a1c2e --model openai-compatible:qwen3-coder --base-url http:/
 ```
 
 Shared settings go in `.minotaur.yml` at the repository root. API keys go only in environment
-variables.
+variables. A Console login is stored by the `ant` command, not in the repository.
 
 ## Safety
 

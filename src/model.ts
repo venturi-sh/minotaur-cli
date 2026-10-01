@@ -1,6 +1,7 @@
 /**
  * Which model triage talks to. Flags win, then `.minotaur.yml`, then the
- * environment. The key only ever comes from the environment.
+ * environment. An API key only ever comes from the environment. When none is
+ * set, a Claude Console login from `minotaur auth login` is used instead.
  */
 
 import {
@@ -14,10 +15,12 @@ import {
   resolvePricing,
   type Effort,
   type ModelCapabilities,
+  type ModelConnection,
   type ModelPricing,
   type ModelSpec,
 } from './agent/index.js';
 
+import { loadConsoleToken, type Env as AuthEnv } from './auth.js';
 import type { Config } from './config.js';
 
 type LanguageModel = ReturnType<typeof createModel>;
@@ -37,26 +40,30 @@ export interface ResolvedModel {
   destination: string;
 }
 
-type Env = Readonly<Record<string, string | undefined>>;
+type Env = AuthEnv;
 
 const SETUP_HELP = [
   'No model is configured. Either:',
   '  - use a model server you run yourself, such as Ollama:',
   '      --model openai-compatible:qwen3-coder --base-url http://localhost:11434/v1',
   '  - or use Anthropic: export ANTHROPIC_API_KEY=...',
+  '  - or sign in to the Claude Console: minotaur auth login',
   'The same settings can go in .minotaur.yml (model, baseUrl) or MINOTAUR_MODEL and MINOTAUR_BASE_URL.',
 ].join('\n');
 
-export function resolveModel(flags: ModelFlags, config: Config, env: Env): ResolvedModel {
+export async function resolveModel(flags: ModelFlags, config: Config, env: Env): Promise<ResolvedModel> {
   const configured = flags.model ?? config.model ?? env['MINOTAUR_MODEL'];
-  if (!configured && !env['ANTHROPIC_API_KEY']) throw new Error(SETUP_HELP);
-  const spec = parseModelSpec(configured, DEFAULT_EXPLOIT_MODEL, '--model');
-
   const baseURL = flags.baseUrl ?? config.baseUrl ?? env['MINOTAUR_BASE_URL'];
-  const apiKey =
-    spec.provider === 'anthropic' ? (env['ANTHROPIC_API_KEY'] ?? env['MINOTAUR_API_KEY']) : env['MINOTAUR_API_KEY'];
+  const spec = parseModelSpec(configured, DEFAULT_EXPLOIT_MODEL, '--model');
+  const apiKey = spec.provider === 'anthropic' ? (env['ANTHROPIC_API_KEY'] ?? env['MINOTAUR_API_KEY']) : env['MINOTAUR_API_KEY'];
+
+  // An API key always wins. The login is only read when neither key is set.
   if (spec.provider === 'anthropic' && !apiKey) {
-    throw new Error(`${spec.id} needs ANTHROPIC_API_KEY in the environment`);
+    const login = await loadConsoleToken(env);
+    if (!login) {
+      throw new Error(configured ? `${spec.id} needs ANTHROPIC_API_KEY in the environment, or minotaur auth login` : SETUP_HELP);
+    }
+    return finish(spec, { authToken: login.accessToken, signedIn: true, baseURL }, flags, config, env);
   }
   if (spec.provider === 'openai-compatible' && !baseURL) {
     throw new Error(
@@ -64,7 +71,10 @@ export function resolveModel(flags: ModelFlags, config: Config, env: Env): Resol
     );
   }
 
-  const connection = { apiKey, baseURL };
+  return finish(spec, { apiKey, baseURL }, flags, config, env);
+}
+
+function finish(spec: ModelSpec, connection: ModelConnection, flags: ModelFlags, config: Config, env: Env): ResolvedModel {
   const capabilities = capabilitiesOf(spec);
   if (flags.effort && !capabilities.effort) {
     throw new Error(`--effort only applies to Anthropic models, not ${spec.id}`);

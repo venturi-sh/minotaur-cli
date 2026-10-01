@@ -4,7 +4,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -191,6 +191,33 @@ describe('minotaur', () => {
     await expect(main(['nope'])).rejects.toThrow(/unknown command "nope"/);
     await expect(main([root, 'again'])).rejects.toThrow(/at most one path/);
   });
+
+  it('lists signing in, and auth status does not print the token', async () => {
+    expect(await main(['--help'])).toBe(0);
+    expect(stdout).toContain('minotaur auth login');
+
+    const dir = await mkdtemp(join(tmpdir(), 'minotaur-auth-'));
+    const token = 'sk-ant-oat01-not-for-stdout';
+    const credentials = join(dir, 'credentials');
+    await mkdir(credentials, { recursive: true });
+    const file = join(credentials, 'default.json');
+    await writeFile(file, JSON.stringify({ type: 'oauth_token', access_token: token, account_email: 'ada@example.com' }));
+    await chmod(file, 0o600);
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
+    vi.stubEnv('MINOTAUR_API_KEY', '');
+    vi.stubEnv('ANTHROPIC_PROFILE', '');
+    vi.stubEnv('ANTHROPIC_CONFIG_DIR', dir);
+    stdout = '';
+    try {
+      expect(await main(['auth', 'status'])).toBe(0);
+      expect(stdout).toContain('ada@example.com');
+      expect(stdout).not.toContain(token);
+      await expect(main(['auth'])).rejects.toThrow(/login, status or logout/);
+      await expect(main(['auth', 'status', 'extra'])).rejects.toThrow(/one action/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 const sources = () => ['--source', join(root, 'semgrep.json'), '--source', join(root, 'gitleaks.sarif')];
@@ -216,11 +243,17 @@ const verdict = {
 describe('minotaur scan', () => {
   it('refuses a folder without git, or without a commit, and says how to make one', async () => {
     const plain = await realpath(await mkdtemp(join(tmpdir(), 'minotaur-plain-')));
+    const stdin = process.stdin.isTTY;
+    const stderr = process.stderr.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: false });
+    Object.defineProperty(process.stderr, 'isTTY', { configurable: true, value: false });
     try {
       await expect(main(['scan', plain, ...sources()])).rejects.toThrow(/not in a git repository[\s\S]*git init && git add -A && git commit/);
       execFileSync('git', ['init', '-q'], { cwd: plain });
       await expect(main(['scan', plain, ...sources()])).rejects.toThrow(/has no commits yet[\s\S]*git add -A && git commit/);
     } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: stdin });
+      Object.defineProperty(process.stderr, 'isTTY', { configurable: true, value: stderr });
       await rm(plain, { recursive: true, force: true });
     }
   });

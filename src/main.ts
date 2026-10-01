@@ -7,6 +7,7 @@
  *   minotaur verdict ID [PATH]      store an answer an agent worked out itself
  *   minotaur fix ID... [PATH]       fix findings on a new branch, checked by a rescan
  *   minotaur mark ID STATE [PATH]   record a person's decision about a finding
+ *   minotaur auth login             sign in to the Claude Console, when no API key is set
  *
  * Results go to stdout and everything else to stderr, so `--json` output can
  * be piped or redirected without progress mixed into it.
@@ -22,6 +23,7 @@ import { FOCUS_LEVELS, SEVERITIES, focusRank, severityRank, type Focus, type Sev
 
 import { advisoryCacheDir, lookupAdvisories, rankFindings } from './advisories.js';
 
+import { authStatusText, consoleLogin, consoleLogout } from './auth.js';
 import { loadConfig, sourceFromFlag, type Config, type SourceConfig } from './config.js';
 import { browse, type Loaded } from './interactive/app.js';
 import type { ScanReporter } from './interactive/loading.js';
@@ -121,6 +123,12 @@ Usage:
   minotaur mark ID DECISION [PATH]        Record your own decision about a finding:
                                           false-positive, accepted-risk, fixed, confirmed,
                                           or open to remove it
+  minotaur auth login                     Sign in to the Claude Console. Used when no API key is set
+  minotaur auth status                    Show whether a key or that login would be used
+  minotaur auth logout                    Forget the Console login
+
+Minotaur looks at a git repository with at least one commit. If the folder is not one,
+it offers to make a repository and commit a snapshot.
 
 Sources (all commands):
   --commit REF           The commit to look at: a hash, branch or tag (default HEAD).
@@ -239,8 +247,17 @@ mark:
   accepted risks and fixed findings are hidden unless --all. A secret marked a
   false positive no longer keeps its file away from checks.
 
+auth:
+  minotaur auth login        Sign in to the Claude Console with the ant command.
+                             If ant is missing, Minotaur offers to install it.
+                             Triage and fix use that login when no API key is set.
+  --no-browser               Print the address instead of opening a browser
+  minotaur auth status       Show whether an API key or the Console login would be used
+  minotaur auth logout       Forget the Console login. This also logs the ant command out.
+
 Environment:
-  ANTHROPIC_API_KEY, MINOTAUR_API_KEY, MINOTAUR_MODEL, MINOTAUR_BASE_URL,
+  ANTHROPIC_API_KEY or MINOTAUR_API_KEY, or a Claude Console login from
+  "minotaur auth login" when neither key is set. MINOTAUR_MODEL, MINOTAUR_BASE_URL,
   MINOTAUR_CACHE_DIR (where downloaded scanners, the last scans, checks and copies
   of commits are kept)
 `;
@@ -277,6 +294,7 @@ const OPTIONS = {
   message: { type: 'string' },
   'max-total-usd': { type: 'string' },
   'allow-unverified': { type: 'boolean' },
+  'no-browser': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'v' },
 } as const;
@@ -347,10 +365,12 @@ export async function main(argv: readonly string[]): Promise<number> {
     const { ids, path } = await idsAndPath(rest);
     return fix(ids, await repoRoot(path), values);
   }
-  throw new UsageError(`unknown command "${command}"; expected scan, triage, brief, verdict, fix or mark`);
+  if (command === 'auth') return auth(rest, values);
+  throw new UsageError(`unknown command "${command}"; expected ${COMMAND_NAMES}`);
 }
 
-const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'fix', 'mark']);
+const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'fix', 'mark', 'auth']);
+const COMMAND_NAMES = 'scan, triage, brief, verdict, fix, mark or auth';
 
 /**
  * The first word is a command, or a directory to browse. `minotaur .` and
@@ -362,7 +382,7 @@ async function splitCommand(positionals: readonly string[]): Promise<{ command: 
   if (!first || COMMANDS.has(first)) return { command: first, rest };
   const info = await stat(fromInvocation(first)).catch(() => null);
   if (!info?.isDirectory()) {
-    throw new UsageError(`unknown command "${first}"; expected scan, triage, brief, verdict, fix or mark`);
+    throw new UsageError(`unknown command "${first}"; expected ${COMMAND_NAMES}`);
   }
   if (rest.length > 0) throw new UsageError('minotaur takes at most one path');
   return { command: undefined, rest: [first] };
@@ -597,7 +617,7 @@ async function interactive(root: string, values: Values): Promise<number> {
   let model: ResolvedModel | null = null;
   let status: ModelStatus;
   try {
-    model = resolveModel(modelFlags(values), config, process.env);
+    model = await resolveModel(modelFlags(values), config, process.env);
     status = { ok: true, destination: describeModel(model), limits: describeLimits(model, limits) };
   } catch (error) {
     // Browsing works without a model; the view explains how to set one up when a check is asked for.
@@ -800,7 +820,7 @@ async function annotate(
   values: Values,
 ) {
   const protectedPaths = new Set(collected.protectedPaths);
-  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), collected.tree, findings, configuredIdentity(config, values), protectedPaths);
+  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), collected.tree, findings, await configuredIdentity(config, values), protectedPaths);
   return withChecks(findings, protectedPaths, checks);
 }
 
@@ -809,9 +829,9 @@ function hasAnswer(finding: LocalFinding): boolean {
   return check != null;
 }
 
-function configuredIdentity(config: Config, values: Values): CheckIdentity | null {
+async function configuredIdentity(config: Config, values: Values): Promise<CheckIdentity | null> {
   try {
-    return identityOf(resolveModel(modelFlags(values), config, process.env));
+    return identityOf(await resolveModel(modelFlags(values), config, process.env));
   } catch {
     return null;
   }
@@ -858,7 +878,7 @@ async function openFinding(id: string, root: string, values: Values) {
 
 async function triage(id: string, root: string, values: Values): Promise<number> {
   const { config } = await loadConfig(root);
-  const model = resolveModel(modelFlags(values), config, process.env);
+  const model = await resolveModel(modelFlags(values), config, process.env);
   const limits = triageLimits(values, config);
   const { where, tree, protectedPaths, finding } = await openFinding(id, root, values);
   const refusal = refusalFor(finding, protectedPaths);
@@ -976,7 +996,7 @@ async function brief(id: string, root: string, values: Values): Promise<number> 
     scopeOf(opened.where),
     opened.tree,
     [opened.finding],
-    configuredIdentity(opened.config, values),
+    await configuredIdentity(opened.config, values),
     opened.protectedPaths,
   );
   const earlier = checks.get(opened.finding.fingerprint)?.result;
@@ -1146,7 +1166,7 @@ async function fix(ids: readonly string[] | null, root: string, values: Values):
   let model: ResolvedModel | null = null;
   let noModel: string | undefined;
   try {
-    model = resolveModel(modelFlags(values), config, process.env);
+    model = await resolveModel(modelFlags(values), config, process.env);
   } catch (error) {
     noModel = (error as Error).message;
   }
@@ -1304,6 +1324,19 @@ function positiveNumber(value: string | undefined, flag: string): number | undef
 
 function info(message: string): void {
   process.stderr.write(`${message}\n`);
+}
+
+/** `minotaur auth`: sign in to the Claude Console, or show what would be used. */
+async function auth(rest: readonly string[], values: Values): Promise<number> {
+  const [action, ...extra] = rest;
+  if (extra.length > 0) throw new UsageError('auth takes one action: login, status or logout');
+  if (action === 'status') {
+    process.stdout.write(`${await authStatusText(process.env)}\n`);
+    return 0;
+  }
+  if (action === 'login') return consoleLogin({ noBrowser: values['no-browser'] === true, env: process.env });
+  if (action === 'logout') return consoleLogout();
+  throw new UsageError('auth needs an action: login, status or logout');
 }
 
 /** 0 when the command did its job, 1 when it could not, 2 when it was called wrongly. */

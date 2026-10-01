@@ -42,17 +42,31 @@ export class CommitError extends Error {}
 
 /** Every run looks at one commit, so a folder without one needs a snapshot first. */
 const COMMIT_HINT = 'git add -A && git commit -m snapshot';
+const MAKE_REPO_QUESTION = 'This folder is not a git repository. Make one here and commit a snapshot? [y/N] ';
+const MAKE_COMMIT_QUESTION = 'This repository has no commits yet. Commit a snapshot? [y/N] ';
+
+export interface ResolveOptions {
+  /** When set, used instead of the terminal question. */
+  ask?: (question: string) => Promise<boolean>;
+}
 
 /** Works out which commit to look at. Quick: only `git` metadata is read. */
-export async function resolveTarget(repo: string, ref: string | undefined): Promise<Target> {
-  const top = (await git(repo, ['rev-parse', '--show-toplevel']))?.trim();
-  if (!top) throw new CommitError(`${repo} is not in a git repository. To scan it, make one first:\n  git init && ${COMMIT_HINT}`);
+export async function resolveTarget(repo: string, ref: string | undefined, options: ResolveOptions = {}): Promise<Target> {
+  let top = (await git(repo, ['rev-parse', '--show-toplevel']))?.trim();
+  if (!top) {
+    if (ref || !(await offerSnapshot(repo, true, options))) throw new CommitError(notARepo(repo));
+    top = (await git(repo, ['rev-parse', '--show-toplevel']))?.trim();
+    if (!top) throw new CommitError(notARepo(repo));
+  }
   const prefix = (await git(repo, ['rev-parse', '--show-prefix']))?.trim() ?? '';
-  const head = (await git(top, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']))?.trim() || null;
-  const sha = (await git(top, ['rev-parse', '-q', '--verify', `${ref ?? 'HEAD'}^{commit}`]))?.trim() || null;
+  let head = (await git(top, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']))?.trim() || null;
+  let sha = (await git(top, ['rev-parse', '-q', '--verify', `${ref ?? 'HEAD'}^{commit}`]))?.trim() || null;
   if (!sha) {
     if (ref) throw new CommitError(`"${ref}" is not a commit in ${top}`);
-    throw new CommitError(`${top} has no commits yet. To scan it, make one first:\n  ${COMMIT_HINT}`);
+    if (!(await offerSnapshot(top, false, options))) throw new CommitError(noCommits(top));
+    sha = (await git(top, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']))?.trim() || null;
+    head = (await git(top, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']))?.trim() || null;
+    if (!sha) throw new CommitError(noCommits(top));
   }
   const [short = sha.slice(0, 7), subject = ''] = ((await git(top, ['log', '-1', '--format=%h%x00%s', sha])) ?? '').trim().split('\0');
   const status = await git(top, statusArgs(prefix));
@@ -150,6 +164,54 @@ async function prune(copies: string): Promise<void> {
 
 async function isDirectory(path: string): Promise<boolean> {
   return (await stat(path).catch(() => null))?.isDirectory() ?? false;
+}
+
+function notARepo(repo: string): string {
+  return `${repo} is not in a git repository. To scan it, make one first:\n  git init && ${COMMIT_HINT}`;
+}
+
+function noCommits(top: string): string {
+  return `${top} has no commits yet. To scan it, make one first:\n  ${COMMIT_HINT}`;
+}
+
+/** On a terminal, offers to `git init` and commit everything, so a scan has a commit to look at. */
+async function offerSnapshot(repo: string, init: boolean, options: ResolveOptions): Promise<boolean> {
+  const interactive = options.ask != null || (Boolean(process.stdin.isTTY) && Boolean(process.stderr.isTTY));
+  if (!interactive) return false;
+  const yes = await (options.ask ?? askYes)(init ? MAKE_REPO_QUESTION : MAKE_COMMIT_QUESTION);
+  if (!yes) return false;
+  try {
+    if (init && (await gitExit(repo, ['init', '-q'])) !== 0) {
+      throw new CommitError(`Could not create a git repository in ${repo}.\n  git init && ${COMMIT_HINT}`);
+    }
+    const committed = (await gitExit(repo, ['add', '-A'])) === 0 && (await gitExit(repo, ['commit', '--allow-empty', '-m', 'snapshot'])) === 0;
+    if (!committed) throw new CommitError(`Could not commit a snapshot in ${repo}.\n  ${COMMIT_HINT}`);
+  } catch (error) {
+    if (error instanceof CommitError) throw error;
+    throw new CommitError(`Could not create a git repository in ${repo}.\n  git init && ${COMMIT_HINT}`);
+  }
+  return true;
+}
+
+function gitExit(cwd: string, args: readonly string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', [...args], { cwd, stdio: 'inherit' });
+    child.on('error', reject);
+    child.on('exit', (code) => resolve(code ?? 1));
+  });
+}
+
+async function askYes(question: string): Promise<boolean> {
+  const { createInterface } = await import('node:readline/promises');
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await prompt.question(question);
+    return /^y(es)?$/i.test(answer.trim());
+  } catch {
+    return false;
+  } finally {
+    prompt.close();
+  }
 }
 
 function git(cwd: string, args: readonly string[]): Promise<string | null> {
