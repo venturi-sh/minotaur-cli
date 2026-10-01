@@ -60,11 +60,14 @@ branch and merge it. Until you do, `scan` and the browser show which findings ha
 
 - Code and configuration findings are fixed by the model. It can read and edit files, but not
   credential files, git files, scanner ignore files, lockfiles or Minotaur's own settings.
-- A dependency with a known fixed version is upgraded by npm, pnpm, go or cargo, or in a pinned
-  `requirements*.txt`, without a model. A dependency that the project does not declare gets an
-  override. If the package manager cannot do it, the model changes the manifest and the package
-  manager updates the lockfile. Other lockfiles, such as `yarn.lock` or `poetry.lock`, are not
-  supported yet.
+- A dependency with a known fixed version is upgraded by npm, pnpm, Yarn, go or cargo, or in a
+  pinned `requirements*.txt`, without a model. A dependency that the project does not declare gets
+  an override (`resolutions` for Yarn). If the package manager cannot do it, the model changes the
+  manifest and the package manager updates the lockfile. Other lockfiles, such as `poetry.lock`,
+  are not supported yet.
+- Yarn 1 and Yarn 2 or later both work. Minotaur runs the `yarn` on your PATH, so for Yarn 2 or
+  later enable Corepack; when its version does not match the format of `yarn.lock`, the fix
+  fails rather than rewrite the whole lockfile.
 - Secrets are never fixed by the model. An agent can remove one with `brief ID --fix`, but you
   must rotate the credential, because git history still has it.
 
@@ -106,6 +109,8 @@ variables.
 - `brief ID --fix` for a secret gives your agent a worktree that contains the credential. The
   brief itself does not contain it. Use this only with an agent you trust with the credential.
 - `fix` runs package managers with their scripts turned off. They connect to their registries.
+  Yarn runs as installed, never the copy a repository pins with `yarnPath`, and a project whose
+  `.yarnrc.yml` loads plugins is not upgraded with Yarn, since plugins are code from the repository.
 - The model writes code that you merge. Review each fix branch like any other change.
 - A secret marked a false positive can be read by checks, so review changes to the decisions
   file like code.

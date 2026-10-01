@@ -13,12 +13,15 @@
  * and `relock` runs the tool afterwards.
  *
  * Package manager scripts are turned off, since the repository is untrusted.
- * The tools do reach their registries.
+ * For the same reason Yarn runs as installed, never the copy a repository
+ * pins with yarnPath, and a project whose .yarnrc.yml loads plugins is left
+ * alone. The tools do reach their registries.
  */
 
 import { spawn } from 'node:child_process';
-import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, relative } from 'node:path';
 
 import { parseDocument } from 'yaml';
 
@@ -54,7 +57,8 @@ export const LOCKFILES = [
   'conan.lock',
 ] as const;
 
-type Manager = 'npm' | 'pnpm' | 'go' | 'cargo' | 'pip';
+type Manager = 'npm' | 'pnpm' | 'yarn' | 'go' | 'cargo' | 'pip';
+type NodeManager = 'npm' | 'pnpm' | 'yarn';
 
 /** How a dependency finding gets fixed. */
 export type UpgradePlan =
@@ -69,6 +73,7 @@ export type UpgradePlan =
 const RELOCKABLE: Record<string, Manager> = {
   'package-lock.json': 'npm',
   'pnpm-lock.yaml': 'pnpm',
+  'yarn.lock': 'yarn',
   'Cargo.lock': 'cargo',
   'go.sum': 'go',
   'go.mod': 'go',
@@ -134,6 +139,11 @@ export async function planUpgrade(tree: string, finding: LocalFinding, version: 
     }
     if ((await has('package-lock.json')) || (await has('npm-shrinkwrap.json'))) return npmPlan(tree, dir, 'npm', name, version);
     if (await has('pnpm-lock.yaml')) return npmPlan(tree, dir, 'pnpm', name, version);
+    if (await has('yarn.lock')) {
+      const refused = await yarnRefusal(tree, dir);
+      if (refused) return { kind: 'unsupported', reason: refused };
+      return npmPlan(tree, dir, 'yarn', name, version);
+    }
     if (await has('go.mod')) {
       if (name === 'stdlib' || name === 'go' || name === 'toolchain') {
         return { kind: 'unsupported', reason: `this is in the Go standard library; move the go directive in go.mod to ${version} or later` };
@@ -152,6 +162,10 @@ export async function planUpgrade(tree: string, finding: LocalFinding, version: 
 
 async function modelPlan(tree: string, dir: string, file: string, name: string, lines: string[]): Promise<UpgradePlan> {
   const locks = await lockfilesIn(join(tree, dir));
+  if (locks.includes('yarn.lock')) {
+    const refused = await yarnRefusal(tree, dir);
+    if (refused) return { kind: 'unsupported', reason: refused };
+  }
   const unsupported = locks.filter((lock) => !RELOCKABLE[lock]);
   if (unsupported.length > 0) {
     return {
@@ -173,13 +187,14 @@ async function modelPlan(tree: string, dir: string, file: string, name: string, 
   };
 }
 
-async function npmPlan(tree: string, dir: string, manager: 'npm' | 'pnpm', name: string, version: string): Promise<UpgradePlan> {
+async function npmPlan(tree: string, dir: string, manager: NodeManager, name: string, version: string): Promise<UpgradePlan> {
   const manifest = await readJson(join(tree, dir, 'package.json'));
   const direct = ['dependencies', 'devDependencies', 'optionalDependencies'].some((field) => typeof manifest?.[field]?.[name] === 'string');
   return { kind: 'command', manager, dir, name, version, direct };
 }
 
-export type Runner = (tool: string, args: readonly string[], cwd: string) => Promise<void>;
+/** Runs a tool. The default one resolves with what the tool printed, which only `yarn --version` needs. */
+export type Runner = (tool: string, args: readonly string[], cwd: string) => Promise<string | void>;
 
 /**
  * Runs the upgrade in the worktree. Returns notes for the reviewer. Throws
@@ -202,7 +217,8 @@ export async function applyUpgrade(tree: string, plan: Extract<UpgradePlan, { ki
       await run('cargo', ['update', '-p', plan.name, '--precise', plan.version], cwd);
       return [];
     case 'npm':
-    case 'pnpm': {
+    case 'pnpm':
+    case 'yarn': {
       const manifest = await readJson(join(cwd, 'package.json'));
       if (plan.direct) {
         const field = ['devDependencies', 'optionalDependencies'].find((name) => typeof manifest?.[name]?.[plan.name] === 'string');
@@ -214,6 +230,12 @@ export async function applyUpgrade(tree: string, plan: Extract<UpgradePlan, { ki
         if (plan.manager === 'npm') {
           const tilde = current.startsWith('~') ? ['--save-prefix=~'] : [];
           await run('npm', ['install', spec, '--package-lock-only', ...NPM_QUIET, ...save, ...exact, ...tilde], cwd);
+        } else if (plan.manager === 'yarn') {
+          const flags = [
+            ...(field === 'devDependencies' ? ['--dev'] : field === 'optionalDependencies' ? ['--optional'] : []),
+            ...(exact.length > 0 ? ['--exact'] : current.startsWith('~') ? ['--tilde'] : []),
+          ];
+          await yarn(cwd, run, (classic) => ['add', spec, ...flags, ...(classic && manifest?.['workspaces'] ? ['-W'] : [])]);
         } else {
           if (current.startsWith('~')) notes.push(`pnpm writes the new range for ${plan.name} as ^${plan.version}; it was ${current}.`);
           await run('pnpm', ['add', spec, '--lockfile-only', '--ignore-scripts', ...save, ...exact, ...((await exists(join(cwd, 'pnpm-workspace.yaml'))) ? ['-w'] : [])], cwd);
@@ -241,9 +263,11 @@ export async function relock(tree: string, dir: string, name: string, run: Runne
 }
 
 async function relockIn(cwd: string, manager: Manager, name: string, run: Runner): Promise<string> {
+  if (manager === 'yarn') return yarn(cwd, run, () => ['install']);
   const commands: Record<Manager, [string, string[]] | null> = {
     npm: ['npm', ['install', '--package-lock-only', ...NPM_QUIET]],
     pnpm: ['pnpm', ['install', '--lockfile-only', '--ignore-scripts']],
+    yarn: null,
     cargo: ['cargo', ['update', '-p', name]],
     go: ['go', ['mod', 'tidy']],
     pip: null,
@@ -256,13 +280,67 @@ async function relockIn(cwd: string, manager: Manager, name: string, run: Runner
 
 const NPM_QUIET = ['--ignore-scripts', '--no-audit', '--no-fund'];
 
+/**
+ * Runs a Yarn command that changes only package.json and yarn.lock. Returns
+ * the command, as a person would type it.
+ *
+ * Yarn 2 and later has a mode for that. Yarn 1 has none: it always installs,
+ * so it installs into a folder outside the tree that is thrown away. Which
+ * one runs depends on Corepack and the project's packageManager field, so it
+ * is asked, and it must match the lockfile's format: otherwise that Yarn
+ * would rewrite the whole lockfile in its own format.
+ */
+async function yarn(cwd: string, run: Runner, command: (classic: boolean) => string[]): Promise<string> {
+  const version = String((await run('yarn', ['--version'], cwd)) ?? '').trim();
+  const major = /^(\d+)\./.exec(version)?.[1];
+  if (!major) throw new UpgradeError(`could not tell which Yarn runs here: yarn --version printed "${version.slice(0, 80)}"`);
+  const classic = Number(major) < 2;
+  const lockIsClassic = !/^__metadata:/m.test(await readFile(join(cwd, 'yarn.lock'), 'utf8').catch(() => ''));
+  if (classic !== lockIsClassic) {
+    throw new ToolMissingError(
+      `yarn.lock is in the Yarn ${lockIsClassic ? '1' : '2+'} format, but the yarn on PATH is ${version}; ` +
+        `install the Yarn the project uses${lockIsClassic ? '' : ', such as with corepack enable'}`,
+    );
+  }
+  const args = command(classic);
+  if (!classic) {
+    const shown = [...args, '--mode=update-lockfile'];
+    await run('yarn', shown, cwd);
+    return `yarn ${shown.join(' ')}`;
+  }
+  const shown = [...args, '--ignore-scripts', '--non-interactive'];
+  const modules = await mkdtemp(join(tmpdir(), 'minotaur-yarn-'));
+  try {
+    await run('yarn', [...shown, '--modules-folder', modules], cwd);
+  } finally {
+    await rm(modules, { recursive: true, force: true });
+    // Yarn 1 writes this beside the manifest when it fails; it is not part of the fix.
+    await rm(join(cwd, 'yarn-error.log'), { force: true });
+  }
+  return `yarn ${shown.join(' ')}`;
+}
+
+/** Why Yarn cannot be run on this project, or null. Plugins are code from the repository that Yarn loads. */
+async function yarnRefusal(tree: string, dir: string): Promise<string | null> {
+  // Yarn reads .yarnrc.yml from every directory above the project as well.
+  for (let at = join(tree, dir); ; at = dirname(at)) {
+    const text = await readFile(join(at, '.yarnrc.yml'), 'utf8').catch(() => null);
+    const plugins: unknown = text === null ? undefined : parseDocument(text).get('plugins');
+    if (plugins !== undefined && plugins !== null) {
+      const file = join(relative(tree, at), '.yarnrc.yml');
+      return `${file} loads Yarn plugins, which are code from the repository, so Minotaur does not run Yarn here`;
+    }
+    if (relative(tree, at) === '' || dirname(at) === at) return null;
+  }
+}
+
 async function lockfilesIn(dir: string): Promise<string[]> {
   const names = [...LOCKFILES, 'go.mod'];
   const found = await Promise.all(names.map(async (name) => ((await exists(join(dir, name))) ? name : null)));
   return found.filter((name): name is string => name !== null);
 }
 
-async function addOverride(cwd: string, manager: 'npm' | 'pnpm', name: string, version: string): Promise<void> {
+async function addOverride(cwd: string, manager: NodeManager, name: string, version: string): Promise<void> {
   const workspace = join(cwd, 'pnpm-workspace.yaml');
   if (manager === 'pnpm' && (await exists(workspace))) {
     // pnpm 10 reads its settings from the workspace file; the comments in it are kept.
@@ -276,6 +354,8 @@ async function addOverride(cwd: string, manager: 'npm' | 'pnpm', name: string, v
   const manifest = JSON.parse(text) as Record<string, unknown>;
   if (manager === 'npm') {
     manifest['overrides'] = { ...(manifest['overrides'] as object | undefined), [name]: version };
+  } else if (manager === 'yarn') {
+    manifest['resolutions'] = { ...(manifest['resolutions'] as object | undefined), [name]: version };
   } else {
     const pnpm = (manifest['pnpm'] as Record<string, unknown> | undefined) ?? {};
     manifest['pnpm'] = { ...pnpm, overrides: { ...(pnpm['overrides'] as object | undefined), [name]: version } };
@@ -334,20 +414,35 @@ async function exists(path: string): Promise<boolean> {
 /** Ten minutes: a first `go get` or `cargo update` can download a lot. */
 const TOOL_TIMEOUT_MS = 10 * 60_000;
 
-async function runTool(tool: string, args: readonly string[], cwd: string): Promise<void> {
+async function runTool(tool: string, args: readonly string[], cwd: string): Promise<string> {
   if (!(await isInstalled(tool))) throw new ToolMissingError(`${tool} is not installed or not on PATH, so the lockfile cannot be updated`);
-  await new Promise<void>((done, fail) => {
+  return new Promise<string>((done, fail) => {
     const child = spawn(tool, args, {
       cwd,
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: TOOL_TIMEOUT_MS,
-      env: { ...process.env, CI: '1', npm_config_ignore_scripts: 'true', npm_config_audit: 'false', npm_config_fund: 'false' },
+      env: {
+        ...process.env,
+        CI: '1',
+        npm_config_ignore_scripts: 'true',
+        npm_config_audit: 'false',
+        npm_config_fund: 'false',
+        // Yarn: never the yarnPath copy from the repository, no scripts, and CI must not make the lockfile frozen.
+        YARN_IGNORE_PATH: '1',
+        YARN_ENABLE_SCRIPTS: 'false',
+        YARN_ENABLE_IMMUTABLE_INSTALLS: 'false',
+        // Yarn 2+ records each install in .yarn/install-state.gz, which is no part of a fix.
+        YARN_INSTALL_STATE_PATH: join(tmpdir(), 'minotaur-yarn-install-state.gz'),
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+      },
     });
+    let stdout = '';
+    child.stdout!.on('data', (chunk: Buffer) => (stdout = (stdout + chunk.toString('utf8')).slice(-2_000)));
     let stderr = '';
     child.stderr!.on('data', (chunk: Buffer) => (stderr = (stderr + chunk.toString('utf8')).slice(-2_000)));
     child.on('error', (error) => fail(new UpgradeError(`${tool} could not start: ${error.message}`)));
     child.on('close', (code, signal) => {
-      if (code === 0) done();
+      if (code === 0) done(stdout);
       else fail(new UpgradeError(`${tool} ${args.join(' ')} failed${signal ? ` (${signal})` : ''}: ${stderr.trim().split('\n').slice(-5).join(' ')}`));
     });
   });

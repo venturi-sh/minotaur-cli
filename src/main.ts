@@ -205,9 +205,10 @@ fix:
   severe in the changed files, and the change does not silence them. A fix that
   fails gets one more attempt.
   Code and configuration are fixed by the model. A dependency with a known fixed
-  version is upgraded by npm, pnpm, go, cargo, or in a pinned requirements file,
-  without a model; the model changes the manifest when that is not possible, and
-  the package manager then updates the lockfile. Secrets are never fixed.
+  version is upgraded by npm, pnpm, yarn, go, cargo, or in a pinned requirements
+  file, without a model; the model changes the manifest when that is not
+  possible, and the package manager then updates the lockfile. Secrets are never
+  fixed.
   To give a PATH with several ids, put it last.
   --all                  Fix every open finding "scan" lists: --focus (default
                          maybe) and --min-severity choose which. Findings marked
