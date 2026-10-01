@@ -192,6 +192,18 @@ describe('minotaur', () => {
     await expect(main([root, 'again'])).rejects.toThrow(/at most one path/);
   });
 
+  it('config needs a terminal', async () => {
+    const restore = terminal(false);
+    try {
+      expect(await main(['--help'])).toBe(0);
+      expect(stdout).toContain('minotaur config');
+      await expect(main(['config'])).rejects.toThrow(/needs a terminal/);
+      await expect(main(['config', root, 'again'])).rejects.toThrow(/at most one path/);
+    } finally {
+      restore();
+    }
+  });
+
   it('lists signing in, and auth status does not print the token', async () => {
     expect(await main(['--help'])).toBe(0);
     expect(stdout).toContain('minotaur auth login');

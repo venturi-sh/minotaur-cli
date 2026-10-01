@@ -31,6 +31,7 @@ git init && git add -A && git commit -m snapshot
 
 ```bash
 minotaur                                   # browse the findings in this repository
+minotaur config                            # choose scanners and a model, write .minotaur.yml
 minotaur ~/code/shop                       # the same, in that repository
 minotaur scan ~/code/shop                  # list findings
 minotaur triage 3f9a1c2e ~/code/shop       # is this one exploitable?
@@ -120,9 +121,11 @@ Or any server that speaks the OpenAI chat API, such as Ollama:
 minotaur triage 3f9a1c2e --model openai-compatible:qwen3-coder --base-url http://localhost:11434/v1
 ```
 
-Shared settings go in `.minotaur.yml` at the repository root. API keys go only in environment
-variables. A Console login is stored by the `ant` command, and an OpenAI key by
-`minotaur auth login openai`, not in the repository.
+`minotaur config` asks which scanners to run and which model to use, and writes them to
+`.minotaur.yml` at the repository root. If Trivy or Opengrep is missing, it offers to download
+them. On macOS, if Homebrew is installed, it offers to install the other scanners with it. API
+keys go only in environment variables. A Console login is stored by the `ant` command, and an
+OpenAI key by `minotaur auth login openai`, not in the repository.
 
 ## Safety
 

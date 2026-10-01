@@ -1,0 +1,7 @@
+# Minotaur settings for this repository. Commit this file.
+# An API key does not belong here. Set ANTHROPIC_API_KEY or MINOTAUR_API_KEY, or run minotaur auth login.
+sources:
+  - scanner: trivy
+  - scanner: osv-scanner
+  - scanner: opengrep
+model: anthropic:claude-sonnet-5

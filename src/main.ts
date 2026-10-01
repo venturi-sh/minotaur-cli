@@ -7,6 +7,7 @@
  *   minotaur verdict ID [PATH]      store an answer an agent worked out itself
  *   minotaur fix ID... [PATH]       fix findings on a new branch, checked by a rescan
  *   minotaur mark ID STATE [PATH]   record a person's decision about a finding
+ *   minotaur config [PATH]          choose scanners and a model, and write .minotaur.yml
  *   minotaur auth login [PROVIDER]  sign in to Anthropic or OpenAI, when no API key is set
  *
  * Results go to stdout and everything else to stderr, so `--json` output can
@@ -24,6 +25,7 @@ import { FOCUS_LEVELS, SEVERITIES, focusRank, severityRank, type Focus, type Sev
 import { advisoryCacheDir, lookupAdvisories, rankFindings } from './advisories.js';
 
 import { chooseAuthProvider, consoleLogin, consoleLogout, formatAuthStatus, openAILogin, openAILogout, parseAuthProvider } from './auth.js';
+import { configureRepository } from './configure-ui.js';
 import { loadConfig, sourceFromFlag, type Config, type SourceConfig } from './config.js';
 import { browse, type Loaded } from './interactive/app.js';
 import type { ScanReporter } from './interactive/loading.js';
@@ -127,6 +129,7 @@ Usage:
                                           With no PROVIDER, choose one from the list.
   minotaur auth status [PROVIDER]         Show whether a key or that login would be used
   minotaur auth logout [PROVIDER]         Forget that login
+  minotaur config [PATH]                  Choose scanners and a model, and write .minotaur.yml
 
 Minotaur looks at a git repository with at least one commit. If the folder is not one,
 it offers to make a repository and commit a snapshot.
@@ -248,6 +251,16 @@ mark:
   Decisions go to ${DECISIONS_FILE}, meant to be committed. False positives,
   accepted risks and fixed findings are hidden unless --all. A secret marked a
   false positive no longer keeps its file away from checks.
+
+config:
+  minotaur config [PATH]     Choose which scanners to run and which model to use,
+                             then write .minotaur.yml in that repository.
+                             An API key is not written there. When Trivy or Opengrep is
+                             chosen and missing, the wizard offers to download it.
+                             On macOS, other missing scanners are installed with
+                             Homebrew when it is available. When Anthropic is
+                             chosen and no key or Console login is set, the
+                             wizard can start "minotaur auth login".
 
 auth:
   minotaur auth login anthropic
@@ -377,11 +390,15 @@ export async function main(argv: readonly string[]): Promise<number> {
     return fix(ids, await repoRoot(path), values);
   }
   if (command === 'auth') return auth(rest, values);
+  if (command === 'config') {
+    if (rest.length > 1) throw new UsageError('config takes at most one path');
+    return configureCommand(await repoRoot(rest[0]));
+  }
   throw new UsageError(`unknown command "${command}"; expected ${COMMAND_NAMES}`);
 }
 
-const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'fix', 'mark', 'auth']);
-const COMMAND_NAMES = 'scan, triage, brief, verdict, fix, mark or auth';
+const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'fix', 'mark', 'auth', 'config']);
+const COMMAND_NAMES = 'scan, triage, brief, verdict, fix, mark, config or auth';
 
 /**
  * The first word is a command, or a directory to browse. `minotaur .` and
@@ -1335,6 +1352,12 @@ function positiveNumber(value: string | undefined, flag: string): number | undef
 
 function info(message: string): void {
   process.stderr.write(`${message}\n`);
+}
+
+/** `minotaur config`: ask for scanners and a model, then write `.minotaur.yml`. */
+async function configureCommand(root: string): Promise<number> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new UsageError('minotaur config needs a terminal');
+  return configureRepository({ root, env: process.env, login: () => consoleLogin({ env: process.env }) });
 }
 
 /** `minotaur auth`: sign in to Anthropic or OpenAI, or show what would be used. */
