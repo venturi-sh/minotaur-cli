@@ -1,9 +1,9 @@
 /**
  * The last scan of each repository, reused while nothing it depends on has
- * changed: the commit, the sources and the scanners, and on the working tree
- * the files git ignores too (a secret there still protects the file). Entries
- * also expire, because a scanner's vulnerability database moves on even when
- * the code does not.
+ * changed: the commit, the sources and the scanners. Gitignored files are not
+ * scanned, so they are not part of that, unless the run asked to include them.
+ * Entries also expire, because a scanner's vulnerability database moves on
+ * even when the code does not.
  */
 
 import { spawn } from 'node:child_process';
@@ -60,10 +60,10 @@ export async function scanKey(
   const hash = createHash('sha256');
   const { repo, copy, prefix } = target;
   hash.update(JSON.stringify({ format: FORMAT, repo, commit: target.commit.sha, copy, prefix, includeIgnored, sources, tools: pinnedTools() }));
-  if (!copy) {
-    const ignoredList = await git(target.top, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z']);
-    if (ignoredList === null) return null;
-    for (const path of ignoredList.split('\0').filter(Boolean)) {
+  if (!copy && includeIgnored) {
+    const listed = await git(target.top, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z']);
+    if (listed === null) return null;
+    for (const path of listed.split('\0').filter(Boolean).sort()) {
       const info = await lstat(join(target.top, path)).catch(() => null);
       hash.update(`${path}\0${info?.size ?? -1}\0${info?.mtimeMs ?? -1}\0`);
     }
@@ -80,25 +80,38 @@ export async function readCachedScan(
   now = Date.now(),
   maxAgeMs = SCAN_MAX_AGE_MS,
 ): Promise<CachedScan | null> {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(await readFile(entryPath(dir, root), 'utf8'));
-  } catch {
-    return null;
-  }
-  const parsed = entrySchema.safeParse(raw);
-  if (!parsed.success) return null;
-  const entry = parsed.data;
-  if (entry.root !== root || entry.key !== key || now - entry.createdAt > maxAgeMs || entry.createdAt > now) return null;
-  return {
-    createdAt: entry.createdAt,
-    result: {
-      findings: entry.findings,
-      sources: entry.sources.map(({ error, ...outcome }) => (error === undefined ? outcome : { ...outcome, error })),
-      ignored: entry.ignored,
-      protectedPaths: entry.protectedPaths,
-    },
-  };
+  const entry = await loadEntry(dir, root);
+  if (!entry || entry.key !== key || now - entry.createdAt > maxAgeMs || entry.createdAt > now) return null;
+  return toCached(entry);
+}
+
+/**
+ * The cached scan when running the same scanners again would produce the same
+ * key. `installed` is what is on PATH; a scanner that was not part of the
+ * cached run needs a fresh look at the tree, so this returns null.
+ */
+export async function matchCachedScan(
+  dir: string,
+  target: Target,
+  tree: string,
+  includeIgnored: boolean,
+  installed: readonly string[],
+  now = Date.now(),
+  maxAgeMs = SCAN_MAX_AGE_MS,
+): Promise<CachedScan | null> {
+  const entry = await loadEntry(dir, target.repo);
+  if (!entry || now - entry.createdAt > maxAgeMs || entry.createdAt > now) return null;
+  const names = entry.sources.map((source) => source.source);
+  if (names.some((name) => !localScannerByName(name))) return null;
+  if (sourcesChanged(names, installed)) return null;
+  const key = await scanKey(
+    target,
+    tree,
+    names.map((scanner) => ({ scanner })),
+    includeIgnored,
+  );
+  if (key !== entry.key) return null;
+  return toCached(entry);
 }
 
 /** Replaces the repository's cached scan. A scan where a source failed is not kept, so the next run tries again. */
@@ -135,6 +148,44 @@ export function describeAge(ms: number): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
   return `${Math.floor(hours / 24)} days ago`;
+}
+
+type Entry = z.infer<typeof entrySchema>;
+
+async function loadEntry(dir: string, root: string): Promise<Entry | null> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(entryPath(dir, root), 'utf8'));
+  } catch {
+    return null;
+  }
+  const parsed = entrySchema.safeParse(raw);
+  if (!parsed.success || parsed.data.root !== root) return null;
+  return parsed.data;
+}
+
+function toCached(entry: Entry): CachedScan {
+  return {
+    createdAt: entry.createdAt,
+    result: {
+      findings: entry.findings,
+      sources: entry.sources.map(({ error, ...outcome }) => (error === undefined ? outcome : { ...outcome, error })),
+      ignored: entry.ignored,
+      protectedPaths: entry.protectedPaths,
+    },
+  };
+}
+
+/**
+ * True when a scanner on PATH was not part of the cached run, or Semgrep and
+ * Opengrep have swapped. Either one can change which sources run.
+ */
+function sourcesChanged(cached: readonly string[], installed: readonly string[]): boolean {
+  const have = new Set(cached);
+  const semgrep = installed.includes('semgrep');
+  if (semgrep && have.has('opengrep')) return true;
+  if (!semgrep && have.has('semgrep')) return true;
+  return installed.some((name) => name !== 'semgrep' && !have.has(name));
 }
 
 function entryPath(dir: string, root: string): string {

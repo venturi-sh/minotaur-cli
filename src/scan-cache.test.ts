@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { resolveTarget } from './commit.js';
 import type { SourceConfig } from './config.js';
-import { describeAge, readCachedScan, scanKey, writeCachedScan } from './scan-cache.js';
+import { describeAge, matchCachedScan, readCachedScan, scanKey, writeCachedScan } from './scan-cache.js';
 import { toLocal, type CollectResult } from './sources.js';
 
 const REPORT = [{ report: 'report.sarif' }];
@@ -43,7 +43,7 @@ describe('scan cache', () => {
     repo = await realpath(await mkdtemp(join(tmpdir(), 'minotaur-cache-repo-')));
     cache = join(await mkdtemp(join(tmpdir(), 'minotaur-cache-')), 'scans');
     run('init', '-q');
-    await writeFile(join(repo, '.gitignore'), 'build/\n');
+    await writeFile(join(repo, '.gitignore'), 'node_modules/\n.env\n');
     await writeFile(join(repo, 'app.js'), 'one\n');
     await writeFile(join(repo, 'report.sarif'), '{}');
     run('add', '.');
@@ -64,23 +64,24 @@ describe('scan cache', () => {
     expect(await keyOf()).toBe(key);
   });
 
-  it('changes the key with the commit, the sources, the ignored-file option and ignored files', async () => {
-    const keys = new Set([await keyOf()]);
-    keys.add(await keyOf(REPORT, true));
-    keys.add(await keyOf([{ scanner: 'trivy' }]));
+  it('changes the key with the commit, the sources and the ignored-file option, not with an ignored file', async () => {
+    const baseline = await keyOf();
+    expect(await keyOf(REPORT, true)).not.toBe(baseline);
+    expect(await keyOf([{ scanner: 'trivy' }])).not.toBe(baseline);
 
-    await mkdir(join(repo, 'build'));
-    await writeFile(join(repo, 'build', 'secret.json'), '{}');
-    keys.add(await keyOf());
-    const later = new Date(Date.now() + 60_000);
-    await utimes(join(repo, 'build', 'secret.json'), later, later);
-    keys.add(await keyOf());
+    await writeFile(join(repo, '.env'), 'TOKEN=1\n');
+    await mkdir(join(repo, 'node_modules', 'pkg'), { recursive: true });
+    await writeFile(join(repo, 'node_modules', 'pkg', 'index.js'), 'x\n');
+    expect(await keyOf()).toBe(baseline);
+
+    const included = await keyOf(REPORT, true);
+    await writeFile(join(repo, '.env'), 'TOKEN=2\n');
+    expect(await keyOf(REPORT, true)).not.toBe(included);
 
     await writeFile(join(repo, 'report.sarif'), '{"runs":[]}');
     run('add', '.');
     run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'next');
-    keys.add(await keyOf());
-    expect(keys.size).toBe(6);
+    expect(await keyOf()).not.toBe(baseline);
   });
 
   it('keeps the key of a commit while uncommitted changes come and go, since they are not scanned', async () => {
@@ -115,6 +116,27 @@ describe('scan cache', () => {
     const [file] = await readdir(cache);
     await writeFile(join(cache, file!), '{"format":1');
     expect(await readCachedScan(cache, repo, key, 2_000)).toBeNull();
+  });
+
+  it('reuses a scan of the same commit when an ignored file changes, unless a new scanner is installed', async () => {
+    const target = await resolveTarget(repo);
+    const sources: SourceConfig[] = [{ scanner: 'trivy' }, { scanner: 'opengrep' }];
+    const key = (await scanKey(target, repo, sources, false))!;
+    const saved = result({
+      sources: [
+        { source: 'trivy', status: 'ok', findings: 1, durationMs: 1 },
+        { source: 'opengrep', status: 'ok', findings: 0, durationMs: 1 },
+      ],
+    });
+    expect(await writeCachedScan(cache, repo, key, saved, 1_000)).toBe(true);
+
+    const hit = await matchCachedScan(cache, target, repo, false, [], 2_000);
+    expect(hit?.createdAt).toBe(1_000);
+    expect(hit?.result.findings).toHaveLength(1);
+    expect(await matchCachedScan(cache, target, repo, false, ['grype'], 2_000)).toBeNull();
+
+    await writeFile(join(repo, '.env'), 'TOKEN=1\n');
+    expect((await matchCachedScan(cache, target, repo, false, [], 2_000))?.createdAt).toBe(1_000);
   });
 
   it('does not keep a scan where a source failed', async () => {

@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { Finding } from './core/index.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { ignoredPaths, scannerSkipArgs } from './ignored.js';
 import { collectFindings, resolveFinding, secretPaths, toLocal } from './sources.js';
 
 function finding(overrides: Partial<Finding> & Pick<Finding, 'fingerprint'>): Finding {
@@ -105,6 +106,19 @@ describe('collectFindings', () => {
     const checkov = result.sources.find((outcome) => outcome.source === 'checkov');
     // Checkov may genuinely be installed on a developer machine; either way the run must not fail.
     expect(['ok', 'failed']).toContain(checkov?.status);
+  });
+
+  it('tells Trivy to skip gitignored paths, and leaves Opengrep to git', async () => {
+    execFileSync('git', ['init', '-q'], { cwd: root });
+    await writeFile(join(root, '.gitignore'), 'node_modules/\n.env\n');
+    await mkdir(join(root, 'node_modules', 'pkg'), { recursive: true });
+    await writeFile(join(root, 'node_modules', 'pkg', 'index.js'), 'x\n');
+    await writeFile(join(root, '.env'), 'TOKEN=1\n');
+    const ignored = await ignoredPaths(root);
+    expect(ignored).toEqual({ dirs: ['node_modules'], files: ['.env'] });
+    expect(scannerSkipArgs('trivy', ignored!)).toEqual(['--skip-dirs', 'node_modules', '--skip-files', '.env']);
+    expect(scannerSkipArgs('opengrep', ignored!)).toEqual([]);
+    expect(await ignoredPaths(join(root, 'missing'))).toBeNull();
   });
 
   it('leaves out findings in files git ignores, but keeps their secrets protecting them', async () => {

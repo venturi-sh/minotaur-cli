@@ -25,7 +25,7 @@ import {
 
 import type { SourceConfig } from './config.js';
 import type { Decision } from './decisions.js';
-import { gitIgnored } from './ignored.js';
+import { gitIgnored, ignoredPaths, scannerSkipArgs, type IgnoredPaths } from './ignored.js';
 import { ensureRules, ensureTool, isManaged, type EnsureOptions } from './managed.js';
 
 export const SHORT_ID_LENGTH = 8;
@@ -86,6 +86,7 @@ export async function collectFindings(
   const outcomes: SourceOutcome[] = [];
   const found: Finding[] = [];
   let target: DetectedTarget | undefined;
+  const skipped = options.includeIgnored ? null : await ignoredPaths(root);
 
   for (const source of sources) {
     const name = 'scanner' in source ? source.scanner : source.report;
@@ -95,7 +96,7 @@ export async function collectFindings(
       let findings: Finding[];
       if ('scanner' in source) {
         target ??= await detectTarget(root);
-        findings = await runScanner(root, source, target, options.managed ?? {});
+        findings = await runScanner(root, source, target, options.managed ?? {}, skipped);
       } else {
         const path = isAbsolute(source.report) ? source.report : resolve(root, source.report);
         findings = (await parseReport(await readFile(path, 'utf8'), options.reportRoot ?? root, source.format ?? undefined)).findings;
@@ -139,6 +140,7 @@ async function runScanner(
   source: { scanner: string; args?: string[] | undefined },
   target: DetectedTarget,
   managed: EnsureOptions,
+  ignored: IgnoredPaths | null,
 ): Promise<Finding[]> {
   const adapter = localScannerByName(source.scanner);
   if (!adapter?.native) {
@@ -151,6 +153,8 @@ async function runScanner(
     const rules = await ensureRules(managed);
     args = directories.flatMap((directory) => ['--config', join(rules, directory)]);
   }
+  const skip = ignored ? scannerSkipArgs(adapter.name, ignored) : [];
+  if (skip.length > 0) args = [...skip, ...(args ?? [])];
   let binary: string | undefined;
   if (!(await isInstalled(adapter.native.binary))) {
     if (!isManaged(adapter.name)) throw new Error(`${adapter.native.binary} is not installed or not on PATH`);

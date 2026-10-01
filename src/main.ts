@@ -40,7 +40,8 @@ import {
   withChecks,
 } from './output.js';
 import { cacheDir } from './managed.js';
-import { describeAge, readCachedScan, scanCacheDir, scanKey, writeCachedScan } from './scan-cache.js';
+import { installedScanners } from './scanners/index.js';
+import { describeAge, matchCachedScan, readCachedScan, scanCacheDir, scanKey, writeCachedScan } from './scan-cache.js';
 import {
   NATIVE_SCANNERS,
   collectFindings,
@@ -129,8 +130,8 @@ Sources (all commands):
                          (SARIF, or a supported scanner's JSON). Repeatable. Overrides
                          .minotaur.yml. Default: trivy, opengrep, and any other installed
                          scanner. Trivy and Opengrep are downloaded when missing.
-  --include-ignored      Also list findings in files git ignores, such as dependencies,
-                         build output and caches
+  --include-ignored      Also scan files git ignores, such as dependencies,
+                         build output and caches, and list what they contain
   --rescan               Scan again even when nothing changed since the last scan.
                          A scan of a commit is reused for up to 24 hours while the
                          sources and scanners stay the same.
@@ -461,10 +462,23 @@ function decided(collected: Gathered, decisions: ReadonlyMap<string, Decision>):
 async function scanned(target: Target, values: Values, config: Config, reporter: ScanReporter): Promise<Gathered> {
   if (target.copy) reporter.step(`Copying ${target.commit.short} out of git`);
   const tree = await treeFor(target, cacheDir());
-  reporter.step('Working out which scanners apply');
-  const sources = await sourcesFor(target, tree, values, config);
   const includeIgnored = values['include-ignored'] ?? false;
   const cache = scanCacheDir(cacheDir());
+  const explicitSources = (values.source?.length ?? 0) > 0 || (config.sources?.length ?? 0) > 0;
+  // The default scanners are already recorded on the cached scan, so a repeat
+  // launch can reuse it without walking the tree to decide which ones apply.
+  if (!values.rescan && !explicitSources) {
+    reporter.step('Looking for an earlier scan of this commit');
+    const installed = (await installedScanners()).map((scanner) => scanner.name);
+    const cached = await matchCachedScan(cache, target, tree, includeIgnored, installed).catch(() => null);
+    if (cached) {
+      reporter.note(`Using the scan of this commit from ${describeAge(Date.now() - cached.createdAt)} (--rescan runs it again)`);
+      return { ...cached.result, tree, cachedAt: cached.createdAt };
+    }
+  }
+
+  reporter.step('Working out which scanners apply');
+  const sources = await sourcesFor(target, tree, values, config);
   reporter.step('Looking for an earlier scan of this commit');
   const key = await scanKey(target, tree, sources, includeIgnored).catch(() => null);
   if (key && !values.rescan) {
