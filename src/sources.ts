@@ -65,6 +65,8 @@ export interface CollectResult {
 export interface CollectOptions {
   onSource?: (outcome: SourceOutcome) => void;
   onStart?: (source: string) => void;
+  /** The findings so far, after each source that found any, so they can be shown before the last source is done. */
+  onFindings?: (partial: CollectResult) => void;
   /** Keep findings in files git ignores, which are left out by default. */
   includeIgnored?: boolean;
   /** Where missing scanners are downloaded to, and how the download is announced. */
@@ -105,6 +107,7 @@ export async function collectFindings(
       const outcome: SourceOutcome = { source: name, status: 'ok', findings: findings.length, durationMs: Date.now() - started };
       outcomes.push(outcome);
       options.onSource?.(outcome);
+      if (options.onFindings && findings.length > 0) options.onFindings(await assemble(root, found, outcomes, options.includeIgnored));
     } catch (error) {
       const outcome: SourceOutcome = {
         source: name,
@@ -123,13 +126,18 @@ export async function collectFindings(
     throw new Error(`every source failed, so there is nothing to show (${reasons})`);
   }
 
+  return assemble(root, found, outcomes, options.includeIgnored);
+}
+
+/** One list from what every source found so far: deduplicated, and without the files git ignores. */
+async function assemble(root: string, found: readonly Finding[], outcomes: readonly SourceOutcome[], includeIgnored = false): Promise<CollectResult> {
   const all = toLocal(dedupeFindings(found));
   const paths = [...new Set(all.flatMap((finding) => (finding.location ? [finding.location.path] : [])))];
-  const ignored = options.includeIgnored || paths.length === 0 ? null : await gitIgnored(root, paths);
+  const ignored = includeIgnored || paths.length === 0 ? null : await gitIgnored(root, paths);
   const findings = ignored ? all.filter((finding) => !finding.location || !ignored.has(finding.location.path)) : all;
   return {
     findings,
-    sources: outcomes,
+    sources: [...outcomes],
     ignored: all.length - findings.length,
     protectedPaths: [...secretPaths(all)].sort(),
   };

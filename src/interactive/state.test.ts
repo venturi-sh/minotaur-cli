@@ -12,6 +12,7 @@ import {
   selectedFinding,
   visibleFindings,
   withFindings,
+  withScanned,
   withViewport,
   type BrowserState,
   type FixView,
@@ -268,5 +269,30 @@ describe('fix keys', () => {
     const checkpoint = state({ question: { kind: 'checkpoint', spentUsd: 10, capUsd: 10, fixed: 1, notFixed: 0, remaining: 2, current: 'aaaa0002' } });
     expect(handleKey(checkpoint, { name: 'c', ctrl: true }, 10).effect).toEqual({ type: 'answer', go: false });
     expect(handleKey(checkpoint, { sequence: 'y' }, 10).effect).toEqual({ type: 'answer', go: true });
+  });
+});
+
+describe('while the scan runs', () => {
+  it('lets the list be browsed, and holds back what needs the whole scan', () => {
+    const scanning = state({ scanning: true });
+    expect(press(scanning, 'down', 'return').view).toBe('detail');
+    for (const name of ['t', 'f', 'm']) {
+      const { state: after, effect } = handleKey(scanning, key(name), 10);
+      expect(effect).toBeUndefined();
+      expect(after.message).toMatch(/Still scanning/);
+    }
+    expect(handleKey(scanning, { sequence: 'F' }, 10).state.question).toBeNull();
+    expect(handleKey(scanning, key('r'), 10).effect).toBeUndefined();
+    expect(handleKey(scanning, key('q'), 10).effect).toEqual({ type: 'quit' });
+    expect(handleKey(state(), key('t'), 10).effect).toMatchObject({ type: 'triage' });
+  });
+
+  it('keeps the cursor on its finding as more arrive', () => {
+    const before = withScanned(state({ cursor: 1, message: 'Downloading trivy' }), { findings: findings.slice(1), ignored: 0, protectedPaths: new Set() });
+    expect(before.cursor).toBe(0);
+    const after = withScanned(before, { findings, ignored: 2, protectedPaths: new Set(['config/key.pem']) });
+    expect(selectedFinding(after)?.id).toBe('aaaa0002');
+    expect(after.ignored).toBe(2);
+    expect(after.message).toBe('Downloading trivy');
   });
 });
