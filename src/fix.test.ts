@@ -370,10 +370,105 @@ describe('dependency fixes', () => {
   });
 
   it('skips a project whose lockfile Minotaur cannot update, without calling the model', async () => {
-    await project({ 'package.json': '{"dependencies":{"lodash":"^4.17.15"}}\n', 'yarn.lock': 'lodash@4.17.15\n' });
-    const result = await run({ findings: [lodash({ location: { path: 'yarn.lock' } })], sources: TRIVY, model: model([]) });
+    await project({ 'pyproject.toml': '[tool.poetry.dependencies]\nflask = "1.0"\n', 'poetry.lock': 'flask 1.0\n' });
+    const flask = lodash({ location: { path: 'poetry.lock' }, package: { name: 'flask', version: '1.0', ecosystem: 'pip', fixedVersion: '2.2.5' } });
+    const result = await run({ findings: [flask], sources: TRIVY, model: model([]) });
     expect(result.results[0]).toMatchObject({ status: 'skipped', steps: 0 });
-    expect(result.results[0]!.error).toContain('cannot update yarn.lock yet');
+    expect(result.results[0]!.error).toContain('cannot update poetry.lock yet');
+  });
+
+  describe('with Yarn', () => {
+    const BERRY_LOCK = '__metadata:\n  version: 8\n\n"lodash@npm:^4.17.15":\n  version: 4.17.15\n';
+    const CLASSIC_LOCK = '# yarn lockfile v1\n\nlodash@^4.17.15:\n  version "4.17.15"\n';
+    const yarnLodash = () => lodash({ location: { path: 'yarn.lock' } });
+
+    /** Answers `yarn --version` with this version, and writes yarn.lock the way Yarn would. */
+    function yarnRecorder(version: string, behaviour: Parameters<typeof recorder>[0] = async () => {}) {
+      const modules: string[] = [];
+      const calls: string[] = [];
+      const runTool: Runner = async (tool, args, cwd) => {
+        const at = args.indexOf('--modules-folder');
+        if (at >= 0) modules.push(args[at + 1]!);
+        calls.push(`${tool} ${args.join(' ')}`.replace(/--modules-folder \S+/, '--modules-folder TMP'));
+        if (args[0] === '--version') return `${version}\n`;
+        await behaviour(tool, args, cwd);
+        const lock = await readFile(join(cwd, 'yarn.lock'), 'utf8');
+        await writeFile(join(cwd, 'yarn.lock'), lock.replace('4.17.15', '4.17.19'));
+      };
+      return { calls, runTool, modules };
+    }
+
+    it('upgrades a direct dependency with Yarn 1, installing outside the tree', async () => {
+      await project({ 'package.json': '{"dependencies":{"lodash":"^4.17.15"}}\n', 'yarn.lock': CLASSIC_LOCK });
+      const { calls, runTool, modules } = yarnRecorder('1.22.22');
+      const result = await run({ findings: [yarnLodash()], sources: TRIVY, model: model([]), runTool, branch: 'minotaur/fix-10da5h00' });
+      expect(calls).toEqual(['yarn --version', 'yarn add lodash@4.17.19 --ignore-scripts --non-interactive --modules-folder TMP']);
+      expect(result.results[0]).toMatchObject({ status: 'fixed', model: 'yarn', steps: 0, changedFiles: ['yarn.lock'] });
+      expect(modules[0]!.startsWith(join(root, '/'))).toBe(false);
+      await expect(readFile(join(modules[0]!, '.yarn-integrity'))).rejects.toThrow();
+      expect(git('log', '-1', '--format=%B', 'minotaur/fix-10da5h00')).toContain('Minotaur-Fixed-By: yarn');
+    });
+
+    it('adds to the root of a Yarn 1 workspace, and keeps a dev dependency pinned exactly', async () => {
+      await project({ 'package.json': '{"workspaces":["packages/*"],"devDependencies":{"lodash":"4.17.15"}}\n', 'yarn.lock': CLASSIC_LOCK });
+      const { calls, runTool } = yarnRecorder('1.22.22');
+      await run({ findings: [yarnLodash()], sources: TRIVY, model: model([]), runTool, branch: 'minotaur/fix-10da5h00' });
+      expect(calls[1]).toBe('yarn add lodash@4.17.19 --dev --exact -W --ignore-scripts --non-interactive --modules-folder TMP');
+    });
+
+    it('upgrades with Yarn 2 and later by updating only the lockfile, keeping a ~ range', async () => {
+      await project({ 'package.json': '{"optionalDependencies":{"lodash":"~4.17.15"}}\n', 'yarn.lock': BERRY_LOCK });
+      const { calls, runTool } = yarnRecorder('4.5.1');
+      const result = await run({ findings: [yarnLodash()], sources: TRIVY, model: model([]), runTool, branch: 'minotaur/fix-10da5h00' });
+      expect(calls).toEqual(['yarn --version', 'yarn add lodash@4.17.19 --optional --tilde --mode=update-lockfile']);
+      expect(result.results[0]!.status).toBe('fixed');
+    });
+
+    it('forces a transitive dependency with resolutions', async () => {
+      await project({ 'package.json': '{\n  "dependencies": { "express": "^4.0.0" }\n}\n', 'yarn.lock': BERRY_LOCK });
+      const { calls, runTool } = yarnRecorder('4.5.1');
+      const result = await run({ findings: [yarnLodash()], sources: TRIVY, model: model([]), runTool, branch: 'minotaur/fix-10da5h00' });
+      expect(calls).toEqual(['yarn --version', 'yarn install --mode=update-lockfile']);
+      expect(result.results[0]).toMatchObject({ status: 'fixed', changedFiles: ['package.json', 'yarn.lock'] });
+      expect(result.results[0]!.notes[0]).toContain('override forces every copy of it to 4.17.19');
+      expect(JSON.parse(git('show', 'minotaur/fix-10da5h00:package.json')).resolutions).toEqual({ lodash: '4.17.19' });
+    });
+
+    it('fails without changing the lockfile when the Yarn on PATH does not match its format', async () => {
+      await project({ 'package.json': '{"dependencies":{"lodash":"^4.17.15"}}\n', 'yarn.lock': BERRY_LOCK });
+      const { calls, runTool } = yarnRecorder('1.22.22');
+      const result = await run({ findings: [yarnLodash()], sources: TRIVY, model: model([]), runTool });
+      expect(calls).toEqual(['yarn --version']);
+      expect(result.results[0]).toMatchObject({ status: 'failed', steps: 0 });
+      expect(result.results[0]!.error).toContain('yarn.lock is in the Yarn 2+ format, but the yarn on PATH is 1.22.22');
+    });
+
+    it('does not run Yarn where the repository configures plugins', async () => {
+      await project({
+        'package.json': '{"dependencies":{"lodash":"^4.17.15"}}\n',
+        'yarn.lock': BERRY_LOCK,
+        '.yarnrc.yml': 'plugins:\n  - path: .yarn/plugins/evil.cjs\n',
+      });
+      const { calls, runTool } = yarnRecorder('4.5.1');
+      const result = await run({ findings: [yarnLodash()], sources: TRIVY, model: model([]), runTool });
+      expect(calls).toEqual([]);
+      expect(result.results[0]).toMatchObject({ status: 'skipped', steps: 0 });
+      expect(result.results[0]!.error).toContain('.yarnrc.yml loads Yarn plugins');
+    });
+
+    it('relocks with Yarn after the model edits the manifest', async () => {
+      await project({ 'package.json': '{"dependencies":{"lodash":"^4.17.15"}}\n', 'yarn.lock': CLASSIC_LOCK });
+      const unknown = yarnLodash();
+      unknown.package = { ...unknown.package!, fixedVersion: undefined };
+      const { calls, runTool } = yarnRecorder('1.22.22');
+      const fixer = model([
+        toolCall('replace_in_file', { path: 'package.json', oldText: '^4.17.15', newText: '^4.17.21' }),
+        toolCall('submit_fix', { outcome: 'fixed', summary: 'Raised lodash.' }),
+      ]);
+      const result = await run({ findings: [unknown], sources: TRIVY, model: fixer, runTool, branch: 'minotaur/fix-10da5h00' });
+      expect(calls).toEqual(['yarn --version', 'yarn install --ignore-scripts --non-interactive --modules-folder TMP']);
+      expect(result.results[0]).toMatchObject({ status: 'fixed', changedFiles: ['package.json', 'yarn.lock'] });
+    });
   });
 
   it('fails without a model when the package manager is not installed', async () => {
