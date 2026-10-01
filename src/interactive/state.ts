@@ -82,6 +82,8 @@ export interface BrowserState {
   fixes: ReadonlyMap<string, FixView>;
   question: Question | null;
   message: string | null;
+  /** Set while the scan runs: the list fills in as sources finish, and nothing that needs the whole scan can start. */
+  scanning: boolean;
 }
 
 export interface Marking {
@@ -140,6 +142,7 @@ export function initialState(options: {
   /** Fixes on branches that are not merged yet, by fingerprint. */
   fixes?: ReadonlyMap<string, FixView> | undefined;
   message?: string | null | undefined;
+  scanning?: boolean | undefined;
 }): BrowserState {
   return {
     root: options.root,
@@ -162,6 +165,7 @@ export function initialState(options: {
     fixes: new Map(options.fixes ?? []),
     question: null,
     message: options.message ?? null,
+    scanning: options.scanning ?? false,
   };
 }
 
@@ -197,6 +201,10 @@ export function handleKey(state: BrowserState, key: Key, pageSize: number): Upda
   const cleared = state.message ? { ...state, message: null } : state;
   if (state.marking) return markKey(cleared, state.marking, key);
   if (state.question) return questionKey(cleared, state.question, key);
+  if (state.scanning) {
+    const waiting = whileScanning(state, key);
+    if (waiting) return { state: { ...cleared, message: waiting } };
+  }
   if (key.ctrl && key.name === 'c') {
     if (state.fixing) return { state: { ...cleared, message: 'Stopping the fix…' }, effect: { type: 'cancel' } };
     if (!state.running) return quit(cleared);
@@ -337,6 +345,19 @@ function markKey(state: BrowserState, marking: Marking, key: Key): Update {
   return { state: { ...state, marking: { ...marking, reason: (marking.reason + typed).slice(0, 2000) } } };
 }
 
+/**
+ * Why a key has to wait for the scan, or null. Checks, fixes and marks need
+ * every source in: until the secret scanner has run, the files a check must
+ * never read are not known yet.
+ */
+function whileScanning(state: BrowserState, key: Key): string | null {
+  const name = key.name ?? key.sequence;
+  if (name === 'r') return 'A scan is already running.';
+  const waits = ['t', 'f', 'F', 'm', ...(state.view === 'detail' ? ['d'] : [])];
+  if (name && waits.includes(name)) return 'Still scanning. Checks, fixes and marks can start once the scan finishes.';
+  return null;
+}
+
 /** Why nothing else can start now, or null. One job runs at a time: a check or a fix. */
 function busy(state: BrowserState): string | null {
   if (state.fixing) return 'A fix is running. Wait for it to finish, or press Ctrl+C to stop it.';
@@ -391,6 +412,15 @@ export function withFindings(
   const count = visibleFindings(after).length;
   const cursor = index !== -1 ? index : Math.min(state.cursor, Math.max(0, count - 1));
   return { ...after, cursor, view: index === -1 ? 'list' : state.view };
+}
+
+/** The list as the scan fills it in: on the same finding when it is still shown, and with any message left as it is. */
+export function withScanned(
+  state: BrowserState,
+  scanned: { findings: readonly LocalFinding[]; ignored: number; protectedPaths: ReadonlySet<string> },
+): BrowserState {
+  const { message } = state;
+  return { ...withFindings(state, scanned.findings, scanned.protectedPaths, ''), ignored: scanned.ignored, message };
 }
 
 /** Stays on the same finding when the new filter still shows it. */

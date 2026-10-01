@@ -7,7 +7,7 @@ import type { TriageResult } from '../triage.js';
 import type { Checkpoint, FixResult, FixRun } from '../fix.js';
 import { browse, type BrowseOptions, type CheckOptions, type FixOptions, type Fixed, type Loaded } from './app.js';
 import { detailLines, lineText, wrap } from './content.js';
-import { INITIAL_SCAN, applyScanEvent, duration, type ScanReporter } from './loading.js';
+import { INITIAL_SCAN, applyScanEvent, scanLabel, type ScanReporter } from './loading.js';
 import { initialState } from './state.js';
 
 const finding: LocalFinding = {
@@ -267,8 +267,9 @@ describe('marking', () => {
 });
 
 describe('loading', () => {
-  it('shows each source while the findings are gathered, then the list', async () => {
+  it('shows the list straight away and adds findings as each source finishes', async () => {
     const { input, output, screen, clear } = terminal();
+    const secret = { ...finding, id: 'aa000001', fingerprint: 'aa000001'.padEnd(64, '0'), kind: 'secret' as const, severity: 'critical' as const, title: 'aws key' };
     let finish: () => void = () => {};
     let report: ScanReporter | undefined;
     const done = browse(
@@ -276,36 +277,52 @@ describe('loading', () => {
         load: (reporter) => {
           report = reporter;
           reporter.step('Working out which scanners apply');
-          return new Promise((resolve) => (finish = () => resolve({ findings: [finding], ignored: 0, protectedPaths: new Set() })));
+          return new Promise((resolve) =>
+            (finish = () => resolve({ findings: [secret, finding], ignored: 0, protectedPaths: new Set(['routes/a.js']), message: 'From the scan.' })),
+          );
         },
+        check: () => Promise.reject(new Error('no check while scanning')),
         input,
         output,
       }),
     );
     await tick();
-    expect(screen()).toContain('Preparing the scan');
+    expect(screen()).toContain('Scanning. Findings show up here as each scanner finishes.');
     expect(screen()).toContain('Working out which scanners apply');
 
-    report!.sources(['trivy', 'opengrep']);
-    report!.start('trivy');
-    report!.note('Downloading trivy 0.73.0 (47 MB) into /cache, once.');
-    await tick();
-    expect(screen()).toContain('Scanning, 0 of 2 sources done');
-    expect(screen()).toContain('looking at dependencies, secrets and configuration');
-    expect(screen()).toContain('Downloading trivy 0.73.0');
-
-    report!.done({ source: 'trivy', status: 'ok', findings: 201, durationMs: 4100 });
+    report!.sources(['opengrep', 'trivy']);
     report!.start('opengrep');
-    report!.done({ source: 'opengrep', status: 'skipped', findings: 0, durationMs: 1, error: 'no code' });
+    report!.note('Downloading opengrep 1.30.0 (40 MB) into /cache, once.');
     await tick();
-    expect(screen()).toContain('201 findings');
-    expect(screen()).toContain('4.1s');
-    expect(screen()).toContain('skipped, no code');
+    expect(screen()).toContain('scanning with opengrep · 0 of 2 sources done');
+    expect(screen()).toContain('Downloading opengrep 1.30.0');
+
+    report!.done({ source: 'opengrep', status: 'ok', findings: 1, durationMs: 4100 });
+    report!.found!({ findings: [finding], ignored: 0, protectedPaths: new Set() });
+    report!.start('trivy');
+    await tick();
+    expect(screen()).toContain('dc407ccb');
+    expect(screen()).toContain('scanning with trivy · 1 of 2 sources done');
+
+    // Until the secret scanner is in, the files a check must not read are not known.
+    clear();
+    input.write('t');
+    await tick();
+    expect(screen()).toContain('Still scanning. Checks, fixes and marks can start once the scan finishes.');
+
+    // The cursor stays on its finding as one ranked above it arrives.
+    report!.done({ source: 'trivy', status: 'failed', findings: 0, durationMs: 10, error: 'database download failed' });
+    report!.found!({ findings: [secret, finding], ignored: 0, protectedPaths: new Set(['routes/a.js']) });
+    await tick();
+    expect(screen()).toContain('aws key');
+    expect(screen()).toMatch(/❯\s*!?\s*dc407ccb/);
 
     clear();
     finish();
     await tick();
-    expect(screen()).toContain('dc407ccb');
+    expect(screen()).toContain('trivy failed: database download failed. From the scan.');
+    expect(screen()).toMatch(/❯\s*!?\s*dc407ccb/);
+    expect(screen()).toContain('2 of 2');
     input.write('q');
     await done;
   });
@@ -348,7 +365,7 @@ describe('loading', () => {
     input.write('r');
     await tick();
     expect(loads).toEqual([false, true]);
-    expect(screen()).toContain('Preparing the scan');
+    expect(screen()).toContain('Scanning. Findings show up here as each scanner finishes.');
 
     clear();
     finish();
@@ -370,9 +387,15 @@ describe('loading', () => {
     expect(raw()).toContain('\u001b[?1049l');
   });
 
-  it('formats times', () => {
-    expect(duration(4100)).toBe('4.1s');
-    expect(duration(65_000)).toBe('1m 05s');
+  it('says what the scan is doing', () => {
+    expect(scanLabel(INITIAL_SCAN)).toBe('Getting ready');
+    let state = applyScanEvent(INITIAL_SCAN, { type: 'sources', names: ['trivy', 'semgrep'] });
+    expect(scanLabel(state)).toBe('0 of 2 sources done');
+    state = applyScanEvent(state, { type: 'start', name: 'semgrep', at: 0 });
+    expect(scanLabel(state)).toBe('scanning with semgrep · 0 of 2 sources done');
+    state = applyScanEvent(state, { type: 'done', outcome: { source: 'semgrep', status: 'ok', findings: 0, durationMs: 1 } });
+    state = applyScanEvent(state, { type: 'step', text: 'Looking for fixes on branches' });
+    expect(scanLabel(state)).toBe('Looking for fixes on branches');
   });
 
   it('keeps the last few notes', () => {

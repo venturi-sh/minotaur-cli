@@ -32,7 +32,7 @@ import {
   type Line,
   type Segment,
 } from './content.js';
-import { INITIAL_SCAN, Loading, applyScanEvent, type ScanEvent, type ScanReporter, type ScanState } from './loading.js';
+import { INITIAL_SCAN, applyScanEvent, scanLabel, type Found, type ScanEvent, type ScanReporter, type ScanState } from './loading.js';
 import {
   handleKey,
   initialState,
@@ -41,6 +41,7 @@ import {
   fixableShown,
   selectedFinding,
   withFindings,
+  withScanned,
   visibleFindings,
   withViewport,
   type BrowserState,
@@ -94,7 +95,7 @@ export interface BrowseOptions {
   root: string;
   /** The commit looked at, such as "3f9a1c2 Fix the login redirect". */
   commit: string | null;
-  /** Gathers the findings while the loading screen shows its progress. `rescan` is set when the person asks for a new scan. */
+  /** Gathers the findings while the list shows them as they come in. `rescan` is set when the person asks for a new scan. */
   load: (reporter: ScanReporter, options: { rescan: boolean }) => Promise<Loaded>;
   model: ModelStatus;
   maxSteps: number;
@@ -107,7 +108,9 @@ export interface BrowseOptions {
   output: NodeJS.WritableStream & { columns?: number; rows?: number };
 }
 
-type Session = Omit<BrowseOptions, 'load' | 'input' | 'output'> & Loaded;
+type Session = Omit<BrowseOptions, 'load' | 'input' | 'output'>;
+
+const NOTHING_YET: Found = { findings: [], ignored: 0, protectedPaths: new Set() };
 
 const ANSWER: Record<string, string> = {
   exploitable: 'exploitable',
@@ -165,27 +168,37 @@ interface Carried {
 
 function Root({ options, onQuit }: { options: BrowseOptions; onQuit: (results: TriageResult[]) => void }) {
   const { exit } = useApp();
-  const { columns, rows } = useWindowSize();
   const [scan, setScan] = useState<ScanState>(INITIAL_SCAN);
+  const [found, setFound] = useState<Found>(NOTHING_YET);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [scans, setScans] = useState(0);
   const carried = useRef<Carried | null>(null);
   // Checks from before a new scan, by fingerprint, so quitting still lists them.
   const earlier = useRef(new Map<string, TriageResult>());
   const lastCommit = useRef(options.commit);
+  const scanning = useRef(true);
 
   useEffect(() => {
+    scanning.current = true;
     const apply = (event: ScanEvent) => setScan((state) => applyScanEvent(state, event));
     const reporter: ScanReporter = {
       step: (text) => apply({ type: 'step', text }),
       sources: (names) => apply({ type: 'sources', names }),
       start: (name) => apply({ type: 'start', name, at: Date.now() }),
-      done: (outcome) => apply({ type: 'done', outcome }),
+      done: (outcome) => {
+        apply({ type: 'done', outcome });
+        if (outcome.status === 'failed') apply({ type: 'note', text: `${outcome.source} failed: ${outcome.error ?? 'unknown error'}` });
+      },
       note: (text) => apply({ type: 'note', text }),
+      found: setFound,
     };
-    options
-      .load(reporter, { rescan: scans > 0 })
-      .then(setLoaded, (error: unknown) => exit(error instanceof Error ? error : new Error(String(error))));
+    options.load(reporter, { rescan: scans > 0 }).then(
+      (done) => {
+        scanning.current = false;
+        setLoaded(done);
+      },
+      (error: unknown) => exit(error instanceof Error ? error : new Error(String(error))),
+    );
   }, [scans]);
 
   const rescan = (state: BrowserState) => {
@@ -197,6 +210,7 @@ function Root({ options, onQuit }: { options: BrowseOptions; onQuit: (results: T
       fingerprint: selectedFinding(state)?.fingerprint,
     };
     setScan(INITIAL_SCAN);
+    setFound(NOTHING_YET);
     setLoaded(null);
     setScans((count) => count + 1);
   };
@@ -204,25 +218,18 @@ function Root({ options, onQuit }: { options: BrowseOptions; onQuit: (results: T
     const all = new Map(earlier.current);
     for (const result of results) all.set(result.finding.fingerprint, result);
     onQuit([...all.values()]);
+    // Raw mode keeps Ctrl+C from reaching the scanners, so stop the whole job as the terminal would have.
+    if (scanning.current) setImmediate(() => process.kill(0, 'SIGINT'));
   };
 
-  useInput(
-    (input, key) => {
-      if (!(key.ctrl && input === 'c') && input !== 'q') return;
-      // Raw mode keeps Ctrl+C from reaching the scanners, so stop the whole job as the terminal would have.
-      exit();
-      setImmediate(() => process.kill(0, 'SIGINT'));
-    },
-    { isActive: loaded === null },
-  );
-
   if (loaded?.commit !== undefined) lastCommit.current = loaded.commit;
-  const commit = lastCommit.current;
-  if (!loaded) return <Loading root={options.root} commit={commit} state={scan} columns={columns} rows={rows} />;
   return (
     <Browser
       key={scans}
-      options={{ ...options, ...loaded, commit }}
+      options={{ ...options, commit: lastCommit.current }}
+      scan={loaded ? null : scan}
+      found={found}
+      loaded={loaded}
       carried={carried.current}
       onQuit={quit}
       onRescan={rescan}
@@ -230,21 +237,31 @@ function Root({ options, onQuit }: { options: BrowseOptions; onQuit: (results: T
   );
 }
 
+/** Starts empty and scanning; the findings arrive as the sources finish. */
 function startingState(options: Session, carried: Carried | null): BrowserState {
-  const start = initialState(options);
-  if (!carried) return start;
-  const kept = { ...start, minSeverity: carried.minSeverity, showNoise: carried.showNoise };
-  const cursor = visibleFindings(kept).findIndex((finding) => finding.fingerprint === carried.fingerprint);
-  return { ...kept, cursor: Math.max(0, cursor), view: cursor === -1 ? 'list' : carried.view };
+  const start = initialState({ ...options, ...NOTHING_YET, scanning: true });
+  return carried ? { ...start, minSeverity: carried.minSeverity, showNoise: carried.showNoise } : start;
+}
+
+/** The sources that failed, so the list still says so once the scan is done. */
+function failures(scan: ScanState): string[] {
+  return scan.sources.flatMap((row) => (row.outcome?.status === 'failed' ? [`${row.name} failed: ${row.outcome.error ?? 'unknown error'}.`] : []));
 }
 
 function Browser({
   options,
+  scan,
+  found,
+  loaded,
   carried,
   onQuit,
   onRescan,
 }: {
   options: Session;
+  /** How far the scan has got, until it is done. */
+  scan: ScanState | null;
+  found: Found;
+  loaded: Loaded | null;
   carried: Carried | null;
   onQuit: (results: TriageResult[]) => void;
   onRescan: (state: BrowserState) => void;
@@ -255,11 +272,50 @@ function Browser({
   // Key handlers and check callbacks read and write through this, so none of them sees a stale state.
   const current = useRef(state);
   const controller = useRef<AbortController | null>(null);
+  // After a rescan, the finding the cursor was on, until it is back in the list or a key is pressed.
+  const follow = useRef(carried?.fingerprint ? carried : null);
+  const lastScan = useRef(scan);
+  if (scan) lastScan.current = scan;
 
   const update = (change: (state: BrowserState) => BrowserState) => {
     current.current = change(current.current);
     setState(current.current);
   };
+
+  /** Back on the finding from before the rescan, once the scan has found it again. */
+  const followed = (state: BrowserState): BrowserState => {
+    const wanted = follow.current;
+    if (!wanted) return state;
+    const cursor = visibleFindings(state).findIndex((finding) => finding.fingerprint === wanted.fingerprint);
+    if (cursor === -1) return state;
+    follow.current = null;
+    return { ...state, cursor, view: wanted.view, detailScroll: 0 };
+  };
+
+  useEffect(() => {
+    if (found !== NOTHING_YET && !loaded) update((state) => followed(withScanned(state, found)));
+  }, [found]);
+
+  const note = scan?.notes.at(-1);
+  useEffect(() => {
+    if (note) update((state) => ({ ...state, message: note }));
+  }, [note, scan?.notes.length]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const message = [...failures(lastScan.current ?? INITIAL_SCAN), ...(loaded.message ? [loaded.message] : [])].join(' ');
+    update((state) => {
+      const after = followed(withScanned(state, loaded));
+      return {
+        ...after,
+        scanning: false,
+        results: new Map([...after.results, ...(loaded.results ?? [])]),
+        fixes: new Map([...after.fixes, ...(loaded.fixes ?? [])]),
+        commit: options.commit,
+        message: message || after.message,
+      };
+    });
+  }, [loaded]);
 
   const quitting = useRef(false);
   const fixController = useRef<AbortController | null>(null);
@@ -389,6 +445,7 @@ function Browser({
   };
 
   useInput((input, key) => {
+    follow.current = null;
     try {
       const layout = layoutFor(current.current, columns, rows);
       const shown = fitToScreen(current.current, layout, columns);
@@ -453,7 +510,7 @@ function Browser({
           <Text color="yellow">{layout.message.join('\n')}</Text>
         </Box>
       )}
-      <Footer state={shown} layout={layout} />
+      <Footer state={shown} layout={layout} scan={scan} />
     </Box>
   );
 }
@@ -526,7 +583,7 @@ function Header({ state, columns }: { state: BrowserState; columns: number }) {
         {severityCounts(visible).map(({ severity, count }) => (
           <Text key={severity} color={SEVERITY_COLOR[severity]}>{`● ${count} ${severity}  `}</Text>
         ))}
-        {visible.length === 0 && <Text dimColor>no findings  </Text>}
+        {visible.length === 0 && <Text dimColor>{state.scanning ? 'no findings yet  ' : 'no findings  '}</Text>}
         {!state.showNoise && hiddenCount(state) > 0 && <Text dimColor>{`${hiddenCount(state)} hidden  `}</Text>}
         {state.ignored > 0 && <Text dimColor>{`${state.ignored} ignored`}</Text>}
       </Box>
@@ -568,7 +625,9 @@ function FindingList({ state, layout }: { state: BrowserState; layout: Layout })
       {rows.length === 0 && (
         <Text dimColor>
           {state.findings.length === 0
-            ? 'No findings.'
+            ? state.scanning
+              ? 'Scanning. Findings show up here as each scanner finishes.'
+              : 'No findings.'
             : state.minSeverity
               ? 'No findings at this severity; press s to show more.'
               : 'Every finding is rated as noise; press a to show them.'}
@@ -685,7 +744,7 @@ function DetailLine({ line, width }: { line: Line; width: number }) {
   );
 }
 
-function Footer({ state, layout }: { state: BrowserState; layout: Layout }) {
+function Footer({ state, layout, scan }: { state: BrowserState; layout: Layout; scan: ScanState | null }) {
   // The count is what F would fix now, so it follows the filters.
   const keys = state.view === 'list' ? LIST_KEYS.map(([key, label]): [string, string] => (key === 'F' ? [key, `${label} (${fixableShown(state).length})`] : [key, label])) : DETAIL_KEYS;
   const running = state.running;
@@ -739,6 +798,8 @@ function Footer({ state, layout }: { state: BrowserState; layout: Layout }) {
           <Spinner
             label={`fixing ${state.fixing.current ?? ''}${state.fixing.total > 1 ? ` (${state.fixing.index + 1} of ${state.fixing.total})` : ''} · ${state.fixing.phase}`}
           />
+        ) : scan ? (
+          <Spinner label={scanLabel(scan)} />
         ) : running ? (
           <Spinner
             label={`checking ${finding?.id ?? ''} · step ${running.steps}/${running.maxSteps}${state.queue.length > 0 ? ` · ${state.queue.length} queued` : ''}`}

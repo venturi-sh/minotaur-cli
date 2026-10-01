@@ -89,6 +89,18 @@ describe('collectFindings', () => {
     expect(seen).toEqual(['a.json:ok:1', `${join(root, 'b.json')}:ok:1`]);
   });
 
+  it('passes on the findings so far after each source that found any', async () => {
+    await writeFile(join(root, 'other.js'), 'eval(x);\n');
+    await writeFile(join(root, 'a.json'), report('app.js'));
+    await writeFile(join(root, 'b.json'), report('other.js'));
+    const partials: string[][] = [];
+    const result = await collectFindings(root, [{ report: 'a.json' }, { report: 'missing.json' }, { report: 'b.json' }], {
+      onFindings: (partial) => partials.push(partial.findings.map((item) => item.location?.path ?? '')),
+    });
+    expect(partials).toEqual([['app.js'], ['app.js', 'other.js']]);
+    expect(result.findings).toHaveLength(2);
+  });
+
   it('keeps going when one source fails, and fails when all do', async () => {
     await writeFile(join(root, 'a.json'), report('app.js'));
     const partial = await collectFindings(root, [{ report: 'a.json' }, { report: 'missing.json' }]);

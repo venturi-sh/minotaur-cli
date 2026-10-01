@@ -449,8 +449,8 @@ async function gather(target: Target, values: Values, config: Config, reporter: 
 }
 
 /** Scanned and rated, before the decisions people made. */
-async function rated(target: Target, values: Values, config: Config, reporter: ScanReporter): Promise<Gathered> {
-  return ranked(await scanned(target, values, config, reporter), config, reporter);
+async function rated(target: Target, values: Values, config: Config, reporter: ScanReporter, onFindings?: (partial: CollectResult) => void): Promise<Gathered> {
+  return ranked(await scanned(target, values, config, reporter, onFindings), config, reporter);
 }
 
 /** With the decisions from the working tree's decisions file, which may not be committed yet. */
@@ -459,7 +459,7 @@ function decided(collected: Gathered, decisions: ReadonlyMap<string, Decision>):
   return { ...collected, findings, protectedPaths: [...liftProtected(collected.protectedPaths, findings)].sort() };
 }
 
-async function scanned(target: Target, values: Values, config: Config, reporter: ScanReporter): Promise<Gathered> {
+async function scanned(target: Target, values: Values, config: Config, reporter: ScanReporter, onFindings?: (partial: CollectResult) => void): Promise<Gathered> {
   if (target.copy) reporter.step(`Copying ${target.commit.short} out of git`);
   const tree = await treeFor(target, cacheDir());
   const includeIgnored = values['include-ignored'] ?? false;
@@ -493,6 +493,7 @@ async function scanned(target: Target, values: Values, config: Config, reporter:
   const collected = await collectFindings(tree, sources, {
     onStart: reporter.start,
     onSource: reporter.done,
+    ...(onFindings ? { onFindings } : {}),
     managed: { onDownload: reporter.note },
     includeIgnored,
     reportRoot: target.repo,
@@ -592,7 +593,13 @@ async function interactive(root: string, values: Values): Promise<number> {
   const load = async (reporter: ScanReporter, { rescan }: { rescan: boolean }): Promise<Loaded> => {
     // HEAD or the working tree may have moved since the view opened.
     if (rescan) where = await target(root, values.commit);
-    undecided = await rated(where, rescan ? { ...values, rescan: true } : values, config, reporter);
+    // The list fills in as each source finishes; rated without the exploitation evidence, which is looked up once at the end.
+    const decisions = await loadDecisions(root);
+    const onFindings = (partial: CollectResult) => {
+      const findings = applyDecisions(rankFindings(partial.findings, new Map(), config.focus), decisions);
+      reporter.found?.({ findings, ignored: partial.ignored, protectedPaths: liftProtected(partial.protectedPaths, findings) });
+    };
+    undecided = await rated(where, rescan ? { ...values, rescan: true } : values, config, reporter, onFindings);
     const collected = decided(undecided, await loadDecisions(root));
     protectedPaths = new Set(collected.protectedPaths);
     tree = collected.tree;
