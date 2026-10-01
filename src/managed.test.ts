@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { MANAGED_TOOLS, OPENGREP_RULES, cacheDir, ensureRules, ensureTool, type Artifact, type ManagedTool } from './managed.js';
+import { MANAGED_TOOLS, OPENGREP_RULES, cacheDir, cachedTools, ensureRules, ensureTool, type Artifact, type ManagedTool } from './managed.js';
 import { collectFindings, defaultSources } from './sources.js';
 
 let work: string;
@@ -67,6 +67,18 @@ describe('cacheDir', () => {
     expect(cacheDir({ MINOTAUR_CACHE_DIR: '/x' }, 'linux')).toBe('/x');
     expect(cacheDir({ XDG_CACHE_HOME: '/xdg' }, 'linux')).toBe('/xdg/minotaur');
     expect(cacheDir({}, 'darwin')).toMatch(/Library\/Caches\/minotaur$/);
+  });
+});
+
+describe('cachedTools', () => {
+  it('names a managed scanner only when that version is already in the cache', async () => {
+    const artifact: Artifact = { url: 'https://example.test/fake', sha256: 'a'.repeat(64), bytes: 1 };
+    const tools = tool('opengrep', artifact);
+    expect(await cachedTools({ cacheDir: cache, platform: 'darwin-arm64', tools })).toEqual([]);
+    await mkdir(join(cache, 'opengrep-9.9.9'), { recursive: true });
+    await writeFile(join(cache, 'opengrep-9.9.9', 'opengrep'), '');
+    expect(await cachedTools({ cacheDir: cache, platform: 'darwin-arm64', tools })).toEqual(['opengrep']);
+    expect(await cachedTools({ cacheDir: cache, platform: 'win32-x64', tools })).toEqual([]);
   });
 });
 

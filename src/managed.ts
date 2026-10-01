@@ -173,21 +173,34 @@ export interface EnsureOptions {
   rules?: Artifact;
 }
 
+/** Managed scanners already in the cache for this platform. A scan will use these instead of downloading again. */
+export async function cachedTools(options: EnsureOptions = {}): Promise<string[]> {
+  const platform = options.platform === undefined ? currentPlatform() : options.platform;
+  if (!platform) return [];
+  const root = options.cacheDir ?? cacheDir();
+  const found: string[] = [];
+  for (const tool of Object.values(options.tools ?? MANAGED_TOOLS)) {
+    if (!tool.artifacts[platform]) continue;
+    if (await exists(toolPath(root, tool.name, tool.version, platform))) found.push(tool.name);
+  }
+  return found;
+}
+
 /** The path of a managed scanner's executable, downloading it the first time. */
 export async function ensureTool(name: string, options: EnsureOptions = {}): Promise<string> {
   const tool = (options.tools ?? MANAGED_TOOLS)[name];
   if (!tool) throw new Error(`${name} is not a scanner Minotaur can download`);
   const platform = options.platform === undefined ? currentPlatform() : options.platform;
   const artifact = platform ? tool.artifacts[platform] : undefined;
-  if (!artifact) {
+  if (!platform || !artifact) {
     throw new Error(`${name} is not installed, and there is no download of it for ${process.platform}-${process.arch}`);
   }
   const root = options.cacheDir ?? cacheDir();
-  const executable = platform === 'win32-x64' ? `${name}.exe` : name;
-  const dir = join(root, `${name}-${tool.version}`);
-  const path = join(dir, executable);
+  const path = toolPath(root, name, tool.version, platform);
   if (await exists(path)) return path;
 
+  const executable = platform === 'win32-x64' ? `${name}.exe` : name;
+  const dir = join(root, `${name}-${tool.version}`);
   options.onDownload?.(`Downloading ${name} ${tool.version} (${megabytes(artifact.bytes)}) into ${root}, once.`);
   await install(root, dir, artifact, options.fetch ?? fetch, async (staging, file) => {
     if (artifact.archive) await extract(file, staging, [executable]);
@@ -292,6 +305,11 @@ async function pruneRules(dir: string): Promise<void> {
   for (const entry of await readdir(dir, { recursive: true, withFileTypes: true })) {
     if (entry.isFile() && entry.name.endsWith('.test.yaml')) await rm(join(entry.parentPath, entry.name));
   }
+}
+
+function toolPath(root: string, name: string, version: string, platform: Platform): string {
+  const executable = platform === 'win32-x64' ? `${name}.exe` : name;
+  return join(root, `${name}-${version}`, executable);
 }
 
 async function exists(path: string): Promise<boolean> {

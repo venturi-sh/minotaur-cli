@@ -28,6 +28,7 @@ import {
   scannerChoices,
   type ConfigChoices,
 } from './configure.js';
+import { cachedTools } from './managed.js';
 import { installedScanners, isInstalled } from './scanners/index.js';
 import { defaultSources } from './sources.js';
 
@@ -96,7 +97,7 @@ export async function configureRepository(options: {
     ? { choices: options.answers, signIn: options.signIn ?? false, install: options.install ?? [], brew: options.brew ?? [], separate: [] as readonly string[] }
     : await askConfig({
         config,
-        installed: new Set((await installedScanners()).map((scanner) => scanner.name)),
+        installed: new Set([...(await installedScanners()).map((scanner) => scanner.name), ...(await cachedTools())]),
         fallbackScanners: (config.sources ?? []).some((source) => 'scanner' in source)
           ? []
           : (await defaultSources(options.root)).flatMap((source) => ('scanner' in source ? [source.scanner] : [])),
