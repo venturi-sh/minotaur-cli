@@ -15,8 +15,8 @@ import type { LanguageModel } from 'ai';
 import { MODEL_PRICING, type ModelPricing } from './budget.js';
 
 export const DEFAULT_TRIAGE_MODEL = 'anthropic:claude-sonnet-5';
-/** The on-demand check is asked for rarely and acted on directly, so it gets the stronger model. */
-export const DEFAULT_EXPLOIT_MODEL = 'anthropic:claude-opus-5-5';
+/** Used when an Anthropic key or Console login is set and no model is named. */
+export const DEFAULT_EXPLOIT_MODEL = 'anthropic:claude-sonnet-5';
 /** Used when the only credential is an OpenAI API key. */
 export const DEFAULT_OPENAI_MODEL = 'openai:gpt-5.4';
 const OPENAI_API = 'https://api.openai.com/v1';

@@ -13,7 +13,7 @@ describe('resolveModel', () => {
 
   it('defaults to the exploit model when only an Anthropic key is present', async () => {
     const resolved = await resolveModel({}, {}, { ANTHROPIC_API_KEY: 'sk-test' });
-    expect(resolved.spec.id).toBe('anthropic:claude-opus-5-5');
+    expect(resolved.spec.id).toBe('anthropic:claude-sonnet-5');
     expect(resolved.effort).toBe('medium');
     expect(resolved.destination).toBe('Anthropic API');
     expect(resolved.capabilities.promptCaching).toBe(true);
@@ -60,7 +60,7 @@ describe('resolveModel', () => {
       const env = { ANTHROPIC_CONFIG_DIR: dir };
       const signedIn = await resolveModel({}, {}, env);
       expect(signedIn.destination).toBe('Anthropic API, signed in');
-      expect(signedIn.spec.id).toBe('anthropic:claude-opus-5-5');
+      expect(signedIn.spec.id).toBe('anthropic:claude-sonnet-5');
       expect(signedIn.destination).not.toContain(token);
 
       const keyed = await resolveModel({}, {}, { ...env, ANTHROPIC_API_KEY: 'sk-ant-api-from-the-env' });

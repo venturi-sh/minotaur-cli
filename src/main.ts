@@ -181,7 +181,7 @@ To fix a finding without a model key, an agent does this:
 
 triage:
   --findings FILE        Read findings from "scan --json" output instead of re-running sources
-  --model PROVIDER:MODEL anthropic:claude-opus-5-5, openai:gpt-5.4, or
+  --model PROVIDER:MODEL anthropic:claude-sonnet-5, openai:gpt-5.4, or
                          openai-compatible:MODEL for a server you run
   --base-url URL         Address of an OpenAI-compatible server, e.g. http://localhost:11434/v1
   --effort LEVEL         Anthropic effort: low, medium, high, xhigh, max (default medium)
