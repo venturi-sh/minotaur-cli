@@ -120,7 +120,8 @@ describe('browse', () => {
     expect(screen()).toContain('dc407ccb');
     expect(screen()).toContain('● 1 high');
     expect(screen()).toContain('3 ignored');
-    expect(screen()).toContain('@ 3f9a1c2 Fix the login redirect');
+    expect(screen()).toContain('@ 3f9a1c2');
+    expect(screen()).not.toContain('Fix the login redirect');
 
     input.write('\r');
     await tick();
@@ -374,7 +375,8 @@ describe('loading', () => {
     clear();
     finish();
     await tick();
-    expect(screen()).toContain('@ 9b8c7d6 Later commit');
+    expect(screen()).toContain('@ 9b8c7d6');
+    expect(screen()).not.toContain('Later commit');
     expect(screen()).toContain('new finding');
     expect(screen()).not.toContain('second finding');
     expect(screen()).toMatch(/❯\s*!?\s*dc407ccb/);

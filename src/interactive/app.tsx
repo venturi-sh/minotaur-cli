@@ -577,7 +577,7 @@ function Header({ state, columns }: { state: BrowserState; columns: number }) {
             ◆ minotaur
           </Text>
           <Text dimColor>{`  ${root}`}</Text>
-          {state.commit && <Text color="yellow">{`  @ ${state.commit}`}</Text>}
+          {state.commit && <Text color="yellow">{`  @ ${state.commit.split(' ')[0]}`}</Text>}
         </Text>
       </Box>
       <Spacer />
