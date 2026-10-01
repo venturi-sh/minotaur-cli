@@ -40,14 +40,18 @@ export interface Layout {
   inner: number;
   /** Rows inside the panel, below the list's column header in the list view. */
   body: number;
+  /** Rows for the scanner list while a scan is running. */
+  panel: number;
   message: string[];
 }
 
-export function layoutFor(state: BrowserState, columns: number, rows: number): Layout {
+export function layoutFor(state: BrowserState, columns: number, rows: number, reserved = 0): Layout {
   const message = state.message ? wrap(state.message, Math.max(10, columns - 2)).slice(0, 6) : [];
   // Title, panel border, footer, and the column header in the list.
   const chrome = 1 + 2 + 1 + (state.view === 'list' ? 1 : 0);
-  return { inner: Math.max(10, columns - 4), body: Math.max(1, rows - chrome - message.length), message };
+  const room = rows - chrome - message.length;
+  const panel = Math.max(0, Math.min(reserved, room - 1));
+  return { inner: Math.max(10, columns - 4), body: Math.max(1, room - panel), message, panel };
 }
 
 export interface CheckLabel {

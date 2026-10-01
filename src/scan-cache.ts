@@ -88,7 +88,9 @@ export async function readCachedScan(
 /**
  * The cached scan when running the same scanners again would produce the same
  * key. `installed` is what is on PATH; a scanner that was not part of the
- * cached run needs a fresh look at the tree, so this returns null.
+ * cached run needs a fresh look at the tree, so this returns null. A scan that
+ * only finished some of its sources stores the key of the full list, which this
+ * rebuild does not reproduce, so this returns null and the caller runs the rest.
  */
 export async function matchCachedScan(
   dir: string,
@@ -114,16 +116,21 @@ export async function matchCachedScan(
   return toCached(entry);
 }
 
-/** Replaces the repository's cached scan. A scan where a source failed is not kept, so the next run tries again. */
+/**
+ * Replaces the repository's cached scan with the sources that finished.
+ * A failed source is left out, so the next run retries it and keeps the rest.
+ * Nothing is written when every source failed.
+ */
 export async function writeCachedScan(dir: string, root: string, key: string, result: CollectResult, now = Date.now()): Promise<boolean> {
-  if (result.sources.some((source) => source.status === 'failed')) return false;
+  const sources = result.sources.filter((source) => source.status !== 'failed');
+  if (sources.length === 0) return false;
   const entry = {
     format: FORMAT,
     root,
     key,
     createdAt: now,
     findings: result.findings.map(withoutSecretSnippet),
-    sources: result.sources,
+    sources,
     ignored: result.ignored,
     protectedPaths: result.protectedPaths,
   };

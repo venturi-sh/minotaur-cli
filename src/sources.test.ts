@@ -7,7 +7,7 @@ import type { Finding } from './core/index.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ignoredPaths, scannerSkipArgs } from './ignored.js';
-import { collectFindings, resolveFinding, secretPaths, toLocal } from './sources.js';
+import { collectFindings, resolveFinding, scanCovers, secretPaths, toLocal } from './sources.js';
 
 function finding(overrides: Partial<Finding> & Pick<Finding, 'fingerprint'>): Finding {
   return {
@@ -159,6 +159,73 @@ describe('collectFindings', () => {
     const all = await collectFindings(root, [{ report: 'report.sarif' }], { includeIgnored: true });
     expect(all.findings).toHaveLength(3);
     expect(all.ignored).toBe(0);
+  });
+
+  it('skips a finished source, shows it first, and settles before the next one starts', async () => {
+    await writeFile(join(root, 'other.js'), 'eval(x);\n');
+    await writeFile(join(root, 'a.json'), report('app.js'));
+    await writeFile(join(root, 'empty.json'), JSON.stringify({ results: [], errors: [], paths: { scanned: [] } }));
+    await writeFile(join(root, 'b.json'), report('other.js'));
+    const first = await collectFindings(root, [{ report: 'a.json' }]);
+    expect(scanCovers(first, [{ report: 'a.json' }])).toBe(true);
+    expect(scanCovers(first, [{ report: 'a.json' }, { report: 'b.json' }])).toBe(false);
+    await rm(join(root, 'a.json'));
+
+    const events: string[] = [];
+    const result = await collectFindings(root, [{ report: 'a.json' }, { report: 'empty.json' }, { report: 'b.json' }], {
+      resume: first,
+      onSource: (outcome) => events.push(`done ${outcome.source}`),
+      onStart: (name) => events.push(`start ${name}`),
+      onFindings: (partial) => events.push(`found ${partial.findings.map((item) => item.location?.path).join(',')}`),
+      onSettled: async (partial) => {
+        const name = partial.sources.at(-1)?.source;
+        events.push(`begin ${name}`);
+        await Promise.resolve();
+        events.push(`end ${name}`);
+      },
+    });
+
+    expect(events).toEqual([
+      'done a.json',
+      'found app.js',
+      'start empty.json',
+      'done empty.json',
+      'begin empty.json',
+      'end empty.json',
+      'start b.json',
+      'done b.json',
+      'found app.js,other.js',
+      'begin b.json',
+      'end b.json',
+    ]);
+    expect(result.findings.map((item) => item.location?.path)).toEqual(['app.js', 'other.js']);
+    expect(result.sources.map((outcome) => outcome.status)).toEqual(['ok', 'ok', 'ok']);
+  });
+
+  it('keeps the ignored count from the scan it resumes', async () => {
+    execFileSync('git', ['init', '-q'], { cwd: root });
+    await writeFile(join(root, '.gitignore'), 'dist/\nlocal.json\n');
+    const run = (tool: string, ruleId: string, uris: string[]) => ({
+      tool: { driver: { name: tool } },
+      results: uris.map((uri) => ({
+        ruleId,
+        locations: [{ physicalLocation: { artifactLocation: { uri }, region: { startLine: 1 } } }],
+      })),
+    });
+    await writeFile(
+      join(root, 'report.sarif'),
+      JSON.stringify({
+        version: '2.1.0',
+        runs: [run('semgrep', 'eval-detected', ['app.js', 'dist/bundle.js']), run('gitleaks', 'github-pat', ['local.json'])],
+      }),
+    );
+    const first = await collectFindings(root, [{ report: 'report.sarif' }]);
+    await writeFile(join(root, 'other.js'), 'eval(x);\n');
+    await writeFile(join(root, 'b.json'), report('other.js'));
+    const second = await collectFindings(root, [{ report: 'report.sarif' }, { report: 'b.json' }], { resume: first });
+    expect(second.ignored).toBe(2);
+    expect(second.protectedPaths).toEqual(['local.json']);
+    expect(second.findings.map((item) => item.location?.path).sort()).toEqual(['app.js', 'other.js']);
   });
 
   it('shows everything outside a git work tree', async () => {

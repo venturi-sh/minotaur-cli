@@ -32,7 +32,7 @@ import {
   type Line,
   type Segment,
 } from './content.js';
-import { INITIAL_SCAN, applyScanEvent, scanLabel, type Found, type ScanEvent, type ScanReporter, type ScanState } from './loading.js';
+import { INITIAL_SCAN, applyScanEvent, scanLabel, scanLineCount, scanLines, windowScanLines, type Found, type ScanEvent, type ScanLine, type ScanReporter, type ScanState } from './loading.js';
 import {
   handleKey,
   initialState,
@@ -444,10 +444,12 @@ function Browser({
       );
   };
 
+  const reserved = scan ? scanLineCount(scan) : 0;
+
   useInput((input, key) => {
     follow.current = null;
     try {
-      const layout = layoutFor(current.current, columns, rows);
+      const layout = layoutFor(current.current, columns, rows, reserved);
       const shown = fitToScreen(current.current, layout, columns);
       const { state: next, effect } = handleKey(shown, toKey(input, key), layout.body);
       if (effect?.type === 'quit') {
@@ -499,12 +501,13 @@ function Browser({
     }
   });
 
-  const layout = layoutFor(state, columns, rows);
+  const layout = layoutFor(state, columns, rows, reserved);
   const shown = fitToScreen(state, layout, columns);
   return (
     <Box flexDirection="column" width={columns} height={rows}>
       <Header state={shown} columns={columns} />
       {shown.view === 'list' ? <FindingList state={shown} layout={layout} /> : <FindingDetail state={shown} layout={layout} />}
+      {scan && layout.panel > 0 && <ScanProgress scan={scan} limit={layout.panel} columns={columns} />}
       {layout.message.length > 0 && (
         <Box paddingX={1} height={layout.message.length}>
           <Text color="yellow">{layout.message.join('\n')}</Text>
@@ -744,6 +747,52 @@ function DetailLine({ line, width }: { line: Line; width: number }) {
   );
 }
 
+function ScanProgress({ scan, limit, columns }: { scan: ScanState; limit: number; columns: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  const running = scan.sources.some((row) => row.status === 'running');
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+  const lines = windowScanLines(scanLines(scan, now), limit);
+  const nameWidth = Math.min(24, Math.max(8, ...lines.map((line) => line.name.length)));
+  return (
+    <Box flexDirection="column" width={columns} height={lines.length} paddingX={1}>
+      {lines.map((line, index) => (
+        <ScanRow key={`${line.name}:${index}`} line={line} nameWidth={nameWidth} />
+      ))}
+    </Box>
+  );
+}
+
+function ScanRow({ line, nameWidth }: { line: ScanLine; nameWidth: number }) {
+  if (!line.name) {
+    return (
+      <Box height={1} overflow="hidden">
+        <Spinner label={line.detail} />
+      </Box>
+    );
+  }
+  const mark = line.status === 'ok' ? '✓' : line.status === 'failed' ? '✗' : line.status === 'skipped' ? '–' : line.status === 'waiting' ? '·' : '';
+  const dim = line.status === 'waiting' || line.status === 'skipped';
+  return (
+    <Box height={1} overflow="hidden">
+      <Box width={2} flexShrink={0}>
+        {line.status === 'running' ? <Spinner label="" /> : <Text {...(line.status === 'failed' ? { color: 'red' } : line.status === 'ok' ? { color: 'green' } : { dimColor: true })}>{mark}</Text>}
+      </Box>
+      <Box width={nameWidth} flexShrink={0} marginRight={2}>
+        <Text wrap="truncate-end" {...(dim ? { dimColor: true } : {})}>
+          {line.name}
+        </Text>
+      </Box>
+      <Text wrap="truncate-end" dimColor={line.status !== 'failed'} {...(line.status === 'failed' ? { color: 'red' } : {})}>
+        {line.detail}
+      </Text>
+    </Box>
+  );
+}
+
 function Footer({ state, layout, scan }: { state: BrowserState; layout: Layout; scan: ScanState | null }) {
   // The count is what F would fix now, so it follows the filters.
   const keys = state.view === 'list' ? LIST_KEYS.map(([key, label]): [string, string] => (key === 'F' ? [key, `${label} (${fixableShown(state).length})`] : [key, label])) : DETAIL_KEYS;
@@ -798,7 +847,7 @@ function Footer({ state, layout, scan }: { state: BrowserState; layout: Layout; 
           <Spinner
             label={`fixing ${state.fixing.current ?? ''}${state.fixing.total > 1 ? ` (${state.fixing.index + 1} of ${state.fixing.total})` : ''} · ${state.fixing.phase}`}
           />
-        ) : scan ? (
+        ) : scan && layout.panel === 0 ? (
           <Spinner label={scanLabel(scan)} />
         ) : running ? (
           <Spinner

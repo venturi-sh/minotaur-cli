@@ -67,12 +67,31 @@ export interface CollectOptions {
   onStart?: (source: string) => void;
   /** The findings so far, after each source that found any, so they can be shown before the last source is done. */
   onFindings?: (partial: CollectResult) => void;
+  /**
+   * Called after every source settles, including one that found nothing.
+   * Awaited before the next source starts, so a finished scanner can be kept.
+   */
+  onSettled?: (partial: CollectResult) => void | Promise<void>;
+  /** Sources already recorded as ok or skipped are not run again. */
+  resume?: CollectResult;
   /** Keep findings in files git ignores, which are left out by default. */
   includeIgnored?: boolean;
   /** Where missing scanners are downloaded to, and how the download is announced. */
   managed?: EnsureOptions;
   /** The directory a report's paths are relative to, when that is not `root`: reports are made in the working tree. */
   reportRoot?: string;
+}
+
+/** True when every source already finished, so nothing needs to run. */
+export function scanCovers(result: CollectResult, sources: readonly SourceConfig[]): boolean {
+  const done = new Set(
+    result.sources.filter((outcome) => outcome.status === 'ok' || outcome.status === 'skipped').map((outcome) => outcome.source),
+  );
+  return sources.every((source) => done.has(sourceName(source)));
+}
+
+function sourceName(source: SourceConfig): string {
+  return 'scanner' in source ? source.scanner : source.report;
 }
 
 export const NATIVE_SCANNERS = LOCAL_SCANNERS.map((scanner) => scanner.name);
@@ -85,13 +104,23 @@ export async function collectFindings(
   sources: readonly SourceConfig[],
   options: CollectOptions = {},
 ): Promise<CollectResult> {
-  const outcomes: SourceOutcome[] = [];
-  const found: Finding[] = [];
+  const resumed = (options.resume?.sources ?? []).filter((outcome) => outcome.status === 'ok' || outcome.status === 'skipped');
+  const finished = new Set(resumed.map((outcome) => outcome.source));
+  const carried = options.resume ? { ignored: options.resume.ignored, protectedPaths: options.resume.protectedPaths } : undefined;
+  const outcomes: SourceOutcome[] = [...resumed];
+  const found: Finding[] = (options.resume?.findings ?? []).map((item) => ({ ...item }));
   let target: DetectedTarget | undefined;
+
+  if (resumed.length > 0) {
+    for (const outcome of resumed) options.onSource?.(outcome);
+    if (options.onFindings && found.length > 0) options.onFindings(await assemble(root, found, outcomes, options.includeIgnored, carried));
+  }
+
   const skipped = options.includeIgnored ? null : await ignoredPaths(root);
 
   for (const source of sources) {
-    const name = 'scanner' in source ? source.scanner : source.report;
+    const name = sourceName(source);
+    if (finished.has(name)) continue;
     options.onStart?.(name);
     const started = Date.now();
     try {
@@ -107,7 +136,9 @@ export async function collectFindings(
       const outcome: SourceOutcome = { source: name, status: 'ok', findings: findings.length, durationMs: Date.now() - started };
       outcomes.push(outcome);
       options.onSource?.(outcome);
-      if (options.onFindings && findings.length > 0) options.onFindings(await assemble(root, found, outcomes, options.includeIgnored));
+      const partial = await assemble(root, found, outcomes, options.includeIgnored, carried);
+      if (options.onFindings && findings.length > 0) options.onFindings(partial);
+      await options.onSettled?.(partial);
     } catch (error) {
       const outcome: SourceOutcome = {
         source: name,
@@ -118,6 +149,7 @@ export async function collectFindings(
       };
       outcomes.push(outcome);
       options.onSource?.(outcome);
+      await options.onSettled?.(await assemble(root, found, outcomes, options.includeIgnored, carried));
     }
   }
 
@@ -126,11 +158,23 @@ export async function collectFindings(
     throw new Error(`every source failed, so there is nothing to show (${reasons})`);
   }
 
-  return assemble(root, found, outcomes, options.includeIgnored);
+  return assemble(root, found, outcomes, options.includeIgnored, carried);
+}
+
+/** Findings already left out of an earlier partial, which are not in `found` to be counted again. */
+interface Carried {
+  ignored: number;
+  protectedPaths: readonly string[];
 }
 
 /** One list from what every source found so far: deduplicated, and without the files git ignores. */
-async function assemble(root: string, found: readonly Finding[], outcomes: readonly SourceOutcome[], includeIgnored = false): Promise<CollectResult> {
+async function assemble(
+  root: string,
+  found: readonly Finding[],
+  outcomes: readonly SourceOutcome[],
+  includeIgnored = false,
+  carried?: Carried,
+): Promise<CollectResult> {
   const all = toLocal(dedupeFindings(found));
   const paths = [...new Set(all.flatMap((finding) => (finding.location ? [finding.location.path] : [])))];
   const ignored = includeIgnored || paths.length === 0 ? null : await gitIgnored(root, paths);
@@ -138,8 +182,8 @@ async function assemble(root: string, found: readonly Finding[], outcomes: reado
   return {
     findings,
     sources: [...outcomes],
-    ignored: all.length - findings.length,
-    protectedPaths: [...secretPaths(all)].sort(),
+    ignored: all.length - findings.length + (carried?.ignored ?? 0),
+    protectedPaths: [...new Set([...(carried?.protectedPaths ?? []), ...secretPaths(all)])].sort(),
   };
 }
 

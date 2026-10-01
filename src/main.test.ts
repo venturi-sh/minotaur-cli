@@ -14,6 +14,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import { main } from './main.js';
 
+const browse = vi.hoisted(() => vi.fn(async () => []));
+vi.mock('./interactive/app.js', () => ({ browse }));
+
 const SECRET = 'ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE1234';
 const QUERY_LINE = "  const sql = `SELECT * FROM Users WHERE email = '${req.body.email}'`;";
 
@@ -145,6 +148,41 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await rm(root, { recursive: true, force: true });
   await rm(cache, { recursive: true, force: true });
+});
+
+describe('minotaur', () => {
+  function terminal(on: boolean): () => void {
+    const stdin = process.stdin.isTTY;
+    const stdout = process.stdout.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: on });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: on });
+    return () => {
+      Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: stdin });
+      Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: stdout });
+    };
+  }
+
+  it('browses the directory it is given, and . means the current one', async () => {
+    const restore = terminal(true);
+    const cwd = process.cwd();
+    try {
+      expect(await main([root])).toBe(0);
+      expect(browse).toHaveBeenCalledWith(expect.objectContaining({ root }));
+
+      browse.mockClear();
+      process.chdir(root);
+      expect(await main(['.'])).toBe(0);
+      expect(browse).toHaveBeenCalledWith(expect.objectContaining({ root }));
+    } finally {
+      process.chdir(cwd);
+      restore();
+    }
+  });
+
+  it('rejects a word that is neither a command nor a directory', async () => {
+    await expect(main(['nope'])).rejects.toThrow(/unknown command "nope"/);
+    await expect(main([root, 'again'])).rejects.toThrow(/at most one path/);
+  });
 });
 
 const sources = () => ['--source', join(root, 'semgrep.json'), '--source', join(root, 'gitleaks.sarif')];

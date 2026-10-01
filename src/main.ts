@@ -46,6 +46,7 @@ import {
   NATIVE_SCANNERS,
   collectFindings,
   defaultSources,
+  scanCovers,
   resolveFinding,
   secretPaths,
   type CollectResult,
@@ -110,7 +111,7 @@ const DEFAULT_MAX_TOTAL_USD = 10;
 const HELP = `minotaur ${VERSION}
 
 Usage:
-  minotaur [options]                      Browse the findings here and check them one at a time
+  minotaur [PATH] [options]               Browse the findings in PATH, or here if omitted
   minotaur scan [PATH] [options]          List findings from the configured sources
   minotaur triage ID [PATH] [options]     Ask a model whether one finding is exploitable
   minotaur brief ID [PATH] [options]      What to read, and how to judge one finding
@@ -294,9 +295,9 @@ export async function main(argv: readonly string[]): Promise<number> {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
-  const [command, ...rest] = positionals;
+  const { command, rest } = await splitCommand(positionals);
   if (!command && !values.help && process.stdin.isTTY && process.stdout.isTTY) {
-    return interactive(await repoRoot(undefined), values);
+    return interactive(await repoRoot(rest[0]), values);
   }
   if (values.help || !command) {
     process.stdout.write(HELP);
@@ -347,6 +348,24 @@ export async function main(argv: readonly string[]): Promise<number> {
     return fix(ids, await repoRoot(path), values);
   }
   throw new UsageError(`unknown command "${command}"; expected scan, triage, brief, verdict, fix or mark`);
+}
+
+const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'fix', 'mark']);
+
+/**
+ * The first word is a command, or a directory to browse. `minotaur .` and
+ * `minotaur /path/to/proj` are the browser; `minotaur scan` stays a command
+ * even when a folder of that name exists.
+ */
+async function splitCommand(positionals: readonly string[]): Promise<{ command: string | undefined; rest: string[] }> {
+  const [first, ...rest] = positionals;
+  if (!first || COMMANDS.has(first)) return { command: first, rest };
+  const info = await stat(fromInvocation(first)).catch(() => null);
+  if (!info?.isDirectory()) {
+    throw new UsageError(`unknown command "${first}"; expected scan, triage, brief, verdict, fix or mark`);
+  }
+  if (rest.length > 0) throw new UsageError('minotaur takes at most one path');
+  return { command: undefined, rest: [first] };
 }
 
 /** Several ids, then maybe a path. The last word is the path when it names a directory. */
@@ -481,26 +500,29 @@ async function scanned(target: Target, values: Values, config: Config, reporter:
   const sources = await sourcesFor(target, tree, values, config);
   reporter.step('Looking for an earlier scan of this commit');
   const key = await scanKey(target, tree, sources, includeIgnored).catch(() => null);
-  if (key && !values.rescan) {
-    const cached = await readCachedScan(cache, target.repo, key);
-    if (cached) {
-      reporter.note(`Using the scan of this commit from ${describeAge(Date.now() - cached.createdAt)} (--rescan runs it again)`);
-      return { ...cached.result, tree, cachedAt: cached.createdAt };
-    }
+  const cached = key && !values.rescan ? await readCachedScan(cache, target.repo, key) : null;
+  if (cached && scanCovers(cached.result, sources)) {
+    reporter.note(`Using the scan of this commit from ${describeAge(Date.now() - cached.createdAt)} (--rescan runs it again)`);
+    return { ...cached.result, tree, cachedAt: cached.createdAt };
   }
 
+  const keep = async (partial: CollectResult) => {
+    if (!key) return;
+    await writeCachedScan(cache, target.repo, key, partial).catch((error: Error) => {
+      reporter.note(`Could not keep the scan for next time: ${error.message}`);
+    });
+  };
   reporter.sources(sources.map((source) => ('scanner' in source ? source.scanner : source.report)));
   const collected = await collectFindings(tree, sources, {
     onStart: reporter.start,
     onSource: reporter.done,
     ...(onFindings ? { onFindings } : {}),
+    onSettled: keep,
+    ...(cached ? { resume: cached.result } : {}),
     managed: { onDownload: reporter.note },
     includeIgnored,
     reportRoot: target.repo,
   });
-  if (key) {
-    await writeCachedScan(cache, target.repo, key, collected).catch((error: Error) => reporter.note(`Could not keep the scan for next time: ${error.message}`));
-  }
   return { ...collected, tree };
 }
 

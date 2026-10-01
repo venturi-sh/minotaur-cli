@@ -22,6 +22,7 @@ git init && git add -A && git commit -m snapshot
 
 ```bash
 minotaur                                   # browse the findings in this repository
+minotaur ~/code/shop                       # the same, in that repository
 minotaur scan ~/code/shop                  # list findings
 minotaur triage 3f9a1c2e ~/code/shop       # is this one exploitable?
 minotaur mark 3f9a1c2e false-positive --reason "Test fixture"

@@ -119,7 +119,7 @@ describe('scan cache', () => {
   });
 
   it('reuses a scan of the same commit when an ignored file changes, unless a new scanner is installed', async () => {
-    const target = await resolveTarget(repo);
+    const target = await resolveTarget(repo, undefined);
     const sources: SourceConfig[] = [{ scanner: 'trivy' }, { scanner: 'opengrep' }];
     const key = (await scanKey(target, repo, sources, false))!;
     const saved = result({
@@ -139,15 +139,38 @@ describe('scan cache', () => {
     expect((await matchCachedScan(cache, target, repo, false, [], 2_000))?.createdAt).toBe(1_000);
   });
 
-  it('does not keep a scan where a source failed', async () => {
+  it('keeps the sources that finished when a later one failed', async () => {
     const failed = result({
       sources: [
         { source: 'trivy', status: 'ok', findings: 1, durationMs: 5 },
         { source: 'opengrep', status: 'failed', findings: 0, durationMs: 5, error: 'boom' },
       ],
     });
+    expect(await writeCachedScan(cache, repo, 'key', failed, 1_000)).toBe(true);
+    const cached = await readCachedScan(cache, repo, 'key', 2_000);
+    expect(cached?.result.sources).toEqual([{ source: 'trivy', status: 'ok', findings: 1, durationMs: 5 }]);
+    expect(cached?.result.findings).toHaveLength(1);
+  });
+
+  it('writes nothing when every source failed', async () => {
+    const failed = result({
+      findings: [],
+      protectedPaths: [],
+      sources: [{ source: 'opengrep', status: 'failed', findings: 0, durationMs: 5, error: 'boom' }],
+    });
     expect(await writeCachedScan(cache, repo, 'key', failed)).toBe(false);
     expect(await readCachedScan(cache, repo, 'key')).toBeNull();
+  });
+
+  it('does not treat a scan that only finished some sources as the whole scan', async () => {
+    const target = await resolveTarget(repo, undefined);
+    const sources: SourceConfig[] = [{ scanner: 'trivy' }, { scanner: 'opengrep' }];
+    const key = (await scanKey(target, repo, sources, false))!;
+    expect(await writeCachedScan(cache, repo, key, result(), 1_000)).toBe(true);
+
+    expect(await matchCachedScan(cache, target, repo, false, [], 2_000)).toBeNull();
+    const cached = await readCachedScan(cache, repo, key, 2_000);
+    expect(cached?.result.sources.map((source) => source.source)).toEqual(['trivy']);
   });
 
   it('says how old a scan is', () => {

@@ -7,7 +7,7 @@ import type { TriageResult } from '../triage.js';
 import type { Checkpoint, FixResult, FixRun } from '../fix.js';
 import { browse, type BrowseOptions, type CheckOptions, type FixOptions, type Fixed, type Loaded } from './app.js';
 import { detailLines, lineText, wrap } from './content.js';
-import { INITIAL_SCAN, applyScanEvent, scanLabel, type ScanReporter } from './loading.js';
+import { INITIAL_SCAN, applyScanEvent, scanLabel, scanLines, windowScanLines, type ScanReporter } from './loading.js';
 import { initialState } from './state.js';
 
 const finding: LocalFinding = {
@@ -294,7 +294,10 @@ describe('loading', () => {
     report!.start('opengrep');
     report!.note('Downloading opengrep 1.30.0 (40 MB) into /cache, once.');
     await tick();
-    expect(screen()).toContain('scanning with opengrep · 0 of 2 sources done');
+    expect(screen()).toContain('opengrep');
+    expect(screen()).toContain('running');
+    expect(screen()).toContain('trivy');
+    expect(screen()).toContain('next');
     expect(screen()).toContain('Downloading opengrep 1.30.0');
 
     report!.done({ source: 'opengrep', status: 'ok', findings: 1, durationMs: 4100 });
@@ -302,7 +305,8 @@ describe('loading', () => {
     report!.start('trivy');
     await tick();
     expect(screen()).toContain('dc407ccb');
-    expect(screen()).toContain('scanning with trivy · 1 of 2 sources done');
+    expect(screen()).toContain('done · 1 finding');
+    expect(screen()).toContain('trivy');
 
     // Until the secret scanner is in, the files a check must not read are not known.
     clear();
@@ -391,11 +395,20 @@ describe('loading', () => {
     expect(scanLabel(INITIAL_SCAN)).toBe('Getting ready');
     let state = applyScanEvent(INITIAL_SCAN, { type: 'sources', names: ['trivy', 'semgrep'] });
     expect(scanLabel(state)).toBe('0 of 2 sources done');
+    expect(scanLines(state).map((line) => `${line.name} ${line.detail}`)).toEqual(['trivy next', 'semgrep next']);
     state = applyScanEvent(state, { type: 'start', name: 'semgrep', at: 0 });
     expect(scanLabel(state)).toBe('scanning with semgrep · 0 of 2 sources done');
-    state = applyScanEvent(state, { type: 'done', outcome: { source: 'semgrep', status: 'ok', findings: 0, durationMs: 1 } });
+    expect(scanLines(state, 12_000).map((line) => line.detail)).toEqual(['next', 'running · 12s']);
+    state = applyScanEvent(state, { type: 'done', outcome: { source: 'semgrep', status: 'ok', findings: 0, durationMs: 4100 } });
+    expect(scanLines(state).find((line) => line.name === 'semgrep')?.detail).toBe('done · nothing found · 4s');
+    state = applyScanEvent(state, { type: 'done', outcome: { source: 'trivy', status: 'failed', findings: 0, durationMs: 1, error: 'database download failed' } });
+    expect(scanLines(state).find((line) => line.name === 'trivy')?.detail).toBe('failed · database download failed');
     state = applyScanEvent(state, { type: 'step', text: 'Looking for fixes on branches' });
     expect(scanLabel(state)).toBe('Looking for fixes on branches');
+    expect(scanLines(state).at(-1)?.detail).toBe('Looking for fixes on branches');
+    const many = scanLines(applyScanEvent(INITIAL_SCAN, { type: 'sources', names: ['a', 'b', 'c', 'd'] }));
+    const started = many.map((line, index) => (line.name === 'c' ? { ...line, status: 'running' as const } : line));
+    expect(windowScanLines(started, 2).map((line) => line.name)).toEqual(['c', 'd']);
   });
 
   it('keeps the last few notes', () => {
