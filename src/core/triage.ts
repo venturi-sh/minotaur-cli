@@ -33,10 +33,9 @@ export type AssessmentStatus = z.infer<typeof assessmentStatusSchema>;
 
 /**
  * Kinds the agent is allowed to look at. Secrets are excluded because judging
- * one means sending the credential to a model provider; IaC waits until the
- * code kinds have eval numbers behind them.
+ * one means sending the credential to a model provider.
  */
-export const TRIAGE_KINDS = ['sca', 'sast'] as const satisfies readonly FindingKind[];
+export const TRIAGE_KINDS = ['sca', 'sast', 'iac', 'license'] as const satisfies readonly FindingKind[];
 
 export function isTriageable(kind: FindingKind): boolean {
   return (TRIAGE_KINDS as readonly FindingKind[]).includes(kind);

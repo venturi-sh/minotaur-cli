@@ -50,18 +50,15 @@ describe('persisted vocabularies', () => {
 });
 
 describe('isTriageable', () => {
-  it('covers dependency and code findings', () => {
+  it('covers every kind except secrets', () => {
     expect(isTriageable('sca')).toBe(true);
     expect(isTriageable('sast')).toBe(true);
+    expect(isTriageable('iac')).toBe(true);
+    expect(isTriageable('license')).toBe(true);
   });
 
   it('never sends a secret to a model provider', () => {
     expect(isTriageable('secret')).toBe(false);
-  });
-
-  it('leaves infrastructure and licence findings for later', () => {
-    expect(isTriageable('iac')).toBe(false);
-    expect(isTriageable('license')).toBe(false);
   });
 });
 

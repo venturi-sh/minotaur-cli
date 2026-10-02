@@ -70,10 +70,9 @@ export type TriageResult = z.infer<typeof triageResultSchema>;
 
 /** Why a finding cannot go to a model, or null when it can. `protectedPaths` are the files with a detected secret. */
 export function refusalFor(finding: LocalFinding, protectedPaths: ReadonlySet<string>): string | null {
-  if (finding.kind === 'secret') {
+  if (!isTriageable(finding.kind)) {
     return 'secret findings are never triaged, because judging one would send the credential to the model provider';
   }
-  if (!isTriageable(finding.kind)) return `only dependency and code findings can be triaged, and this is a ${finding.kind} finding`;
   const path = finding.location?.path;
   const reason = path ? protectedReason(path, protectedPaths) : null;
   if (reason === 'credential_file') return `${path} is a credential file, so it is never sent to a model`;

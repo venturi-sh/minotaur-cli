@@ -36,8 +36,9 @@ describe('refusalFor', () => {
     expect(refusalFor(finding({}), new Set(['routes/login.js']))).toMatch(/contains a detected secret/);
   });
 
-  it('only triages dependency and code findings', () => {
-    expect(refusalFor(finding({ kind: 'iac' }), none)).toMatch(/this is a iac finding/);
+  it('allows infrastructure and licence findings', () => {
+    expect(refusalFor(finding({ kind: 'iac' }), none)).toBeNull();
+    expect(refusalFor(finding({ kind: 'license' }), none)).toBeNull();
   });
 });
 
