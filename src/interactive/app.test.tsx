@@ -4,8 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { LocalFinding } from '../sources.js';
 import type { TriageResult } from '../triage.js';
-import type { Checkpoint, FixResult, FixRun } from '../fix.js';
-import { browse, type BrowseOptions, type CheckOptions, type FixOptions, type Fixed, type Loaded } from './app.js';
+import { browse, type BrowseOptions, type CheckOptions, type Loaded } from './app.js';
 import { detailLines, lineText, wrap } from './content.js';
 import { INITIAL_SCAN, applyScanEvent, scanLabel, scanLines, windowScanLines, type ScanReporter } from './loading.js';
 import { initialState } from './state.js';
@@ -92,7 +91,6 @@ function options({
     maxSteps: 30,
     check: () => Promise.reject(new Error('not expected')),
     decide: () => Promise.reject(new Error('not expected')),
-    fix: () => Promise.reject(new Error('not expected')),
     ...overrides,
   };
 }
@@ -313,7 +311,7 @@ describe('loading', () => {
     clear();
     input.write('t');
     await tick();
-    expect(screen()).toContain('Still scanning. Checks, fixes and marks can start once the scan finishes.');
+    expect(screen()).toContain('Still scanning. Checks and marks can start once the scan finishes.');
 
     // The cursor stays on its finding as one ranked above it arrives.
     report!.done({ source: 'trivy', status: 'failed', findings: 0, durationMs: 10, error: 'database download failed' });
@@ -405,9 +403,9 @@ describe('loading', () => {
     expect(scanLines(state).find((line) => line.name === 'semgrep')?.detail).toBe('done · nothing found · 4s');
     state = applyScanEvent(state, { type: 'done', outcome: { source: 'trivy', status: 'failed', findings: 0, durationMs: 1, error: 'database download failed' } });
     expect(scanLines(state).find((line) => line.name === 'trivy')?.detail).toBe('failed · database download failed');
-    state = applyScanEvent(state, { type: 'step', text: 'Looking for fixes on branches' });
-    expect(scanLabel(state)).toBe('Looking for fixes on branches');
-    expect(scanLines(state).at(-1)?.detail).toBe('Looking for fixes on branches');
+    state = applyScanEvent(state, { type: 'step', text: 'Looking for earlier checks that still apply' });
+    expect(scanLabel(state)).toBe('Looking for earlier checks that still apply');
+    expect(scanLines(state).at(-1)?.detail).toBe('Looking for earlier checks that still apply');
     const many = scanLines(applyScanEvent(INITIAL_SCAN, { type: 'sources', names: ['a', 'b', 'c', 'd'] }));
     const started = many.map((line, index) => (line.name === 'c' ? { ...line, status: 'running' as const } : line));
     expect(windowScanLines(started, 2).map((line) => line.name)).toEqual(['c', 'd']);
@@ -435,162 +433,5 @@ describe('content', () => {
     expect(wrap('abcdefghijklmnop', 10)).toEqual(['abcdefghij', 'klmnop']);
     expect(wrap('a b', 20, '  ')).toEqual(['  a b']);
     expect(wrap('Either:\n  - one two three', 14)).toEqual(['Either:', '  - one two', '  three']);
-  });
-});
-
-function fixResult(overrides: Partial<FixResult> = {}): FixResult {
-  return {
-    version: 1,
-    finding: { id: finding.id, fingerprint: finding.fingerprint, kind: 'sast', severity: 'high', title: finding.title, location: { path: 'routes/a.js', startLine: 3 } },
-    status: 'fixed',
-    branch: 'minotaur/fix-dc407ccb',
-    commit: 'abc1234def5678'.padEnd(40, '0'),
-    summary: 'Replaced eval with a lookup table.',
-    notes: ['Only known codes run now.'],
-    changedFiles: ['routes/a.js'],
-    verification: { scanners: ['opengrep'], passed: true, problems: [] },
-    attempts: 1,
-    model: 'openai-compatible:fake',
-    promptVersion: 'fix-v1',
-    steps: 3,
-    inputTokens: 3000,
-    outputTokens: 300,
-    costUsd: 0,
-    durationMs: 5,
-    error: null,
-    ...overrides,
-  };
-}
-
-function fixRun(results: FixResult[], overrides: Partial<FixRun> = {}): FixRun {
-  return { branch: 'minotaur/fix-dc407ccb', results, interrupted: false, stoppedAtCap: false, alreadyOnBranch: 0, ...overrides };
-}
-
-describe('fixing in the browser', () => {
-  it('fixes the selected finding with progress, then shows the branch and the change', async () => {
-    const { input, output, screen, clear } = terminal(110, 40);
-    let release: (value: Fixed) => void = () => {};
-    let asked: FixOptions | undefined;
-    const done = browse(
-      options({
-        fix: (findings, fix) => {
-          expect(findings.map((item) => item.id)).toEqual([finding.id]);
-          asked = fix;
-          return new Promise((resolve) => (release = resolve));
-        },
-        input,
-        output,
-      }),
-    );
-    await tick();
-    input.write('\r');
-    await tick();
-    input.write('f');
-    await tick();
-    asked!.onEvent({ type: 'start', finding, index: 0, total: 1 });
-    asked!.onEvent({ type: 'verify', finding, scanners: ['opengrep'] });
-    await tick();
-    expect(screen()).toContain('running opengrep again');
-
-    clear();
-    release({ run: fixRun([fixResult()]), diffs: new Map([[finding.fingerprint, '@@ -3 +3 @@\n-eval(req.query.code);\n+run(codes[req.query.code]);']]) });
-    await tick();
-    expect(screen()).toContain('is fixed on branch minotaur/fix-dc407ccb');
-    expect(screen()).toContain('Fixed');
-    expect(screen()).toContain('Replaced eval with a lookup table.');
-    expect(screen()).toContain('+run(codes[req.query.code]);');
-    input.write('q');
-    await done;
-  });
-
-  it('asks before fixing everything shown, and asks again at the cap', async () => {
-    const { input, output, screen, clear } = terminal(140, 30);
-    let asked: FixOptions | undefined;
-    let release: (value: Fixed) => void = () => {};
-    const done = browse(
-      options({
-        fix: (_findings, fix) => {
-          asked = fix;
-          return new Promise((resolve) => (release = resolve));
-        },
-        input,
-        output,
-      }),
-    );
-    await tick();
-    expect(screen()).toContain('F fix all (1)');
-    input.write('F');
-    await tick();
-    expect(screen()).toContain('Fix the 1 finding shown');
-    input.write('n');
-    await tick();
-    expect(screen()).toContain('Nothing was fixed.');
-    expect(asked).toBeUndefined();
-
-    input.write('F');
-    await tick();
-    input.write('y');
-    await tick();
-    expect(asked).toBeDefined();
-    const checkpoint: Checkpoint = { spentUsd: 10.02, capUsd: 10, current: finding, results: [], remaining: 4 };
-    clear();
-    const first = asked!.onCheckpoint(checkpoint);
-    await tick();
-    expect(screen()).toContain('Spent $10.02 of $10.00');
-    input.write('y');
-    expect(await first).toBe(true);
-
-    const second = asked!.onCheckpoint({ ...checkpoint, capUsd: 20, spentUsd: 20.01 });
-    await tick();
-    input.write('x');
-    expect(await second).toBe(false);
-    release({ run: fixRun([fixResult({ status: 'stopped_at_cap', commit: null })], { branch: null, stoppedAtCap: true }), diffs: new Map() });
-    await tick();
-    expect(screen()).toContain('press F again to continue');
-    input.write('q');
-    await done;
-  });
-});
-
-describe('fixes from an earlier run', () => {
-  it('marks a finding fixed on a branch in the list, and shows the change on its page', async () => {
-    const { input, output, screen } = terminal(120, 40);
-    const done = browse(
-      options({
-        loaded: {
-          fixes: new Map([
-            [
-              finding.fingerprint,
-              {
-                status: 'fixed',
-                branch: 'minotaur/fixes-3f9a1c2',
-                commit: 'abc1234def5678'.padEnd(40, '0'),
-                summary: 'Fixed on branch minotaur/fixes-3f9a1c2 by agent:claude, not merged yet.',
-                notes: [],
-                error: null,
-                diff: '-eval(req.query.code);\n+run(codes[req.query.code]);',
-              },
-            ],
-          ]),
-          message: '1 finding has a fix on branch minotaur/fixes-3f9a1c2, not merged yet; merge it to close it.',
-          results: new Map([[finding.fingerprint, result()]]),
-        },
-        input,
-        output,
-      }),
-    );
-    await tick();
-    // The check and the fix are separate: the row shows both.
-    const row = screen().split('\n').find((line) => line.includes(finding.id))!;
-    expect(row).toContain('▲ exploitable');
-    expect(row).toContain('⎇ minotaur/fixes-3f9a1c2');
-    expect(screen()).toContain('FIX');
-    expect(screen()).toContain('not merged yet; merge it to close it');
-    input.write('\r');
-    await tick();
-    expect(screen()).toContain('by agent:claude');
-    expect(screen()).toContain('+run(codes[req.query.code]);');
-    input.write('q');
-    await done;
   });
 });

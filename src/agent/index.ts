@@ -2,7 +2,6 @@ export * from './agent.js';
 export * from './budget.js';
 export * from './cache.js';
 export * from './evidence.js';
-export * from './fix.js';
 export * from './loop.js';
 export * from './model.js';
 export * from './prompt.js';

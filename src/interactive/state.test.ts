@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import type { LocalFinding } from '../sources.js';
 import type { TriageResult } from '../triage.js';
 import {
-  fixableShown,
   handleKey,
   initialState,
   nextCheck,
@@ -15,9 +14,7 @@ import {
   withScanned,
   withViewport,
   type BrowserState,
-  type FixView,
 } from './state.js';
-import { fixLabel } from './content.js';
 
 function finding(id: string, overrides: Partial<LocalFinding> = {}): LocalFinding {
   return {
@@ -225,63 +222,15 @@ describe('details and checks', () => {
   });
 });
 
-describe('fix column', () => {
-  const view = (status: FixView['status'], branch: string | null) => ({ status, branch, commit: branch ? 'c'.repeat(40) : null, summary: null, notes: [], error: null, diff: null });
-  const withFix = (fix: FixView) => state({ fixes: new Map([[findings[0]!.fingerprint, fix]]) });
-
-  it('names the full branch, and marks an unverified fix', () => {
-    expect(fixLabel(withFix(view('fixed', 'minotaur/fixes-3f9a1c2')), findings[0]!).text).toBe('⎇ minotaur/fixes-3f9a1c2');
-    expect(fixLabel(withFix(view('committed_unverified', 'minotaur/fix-aaaa0001')), findings[0]!).text).toBe('⎇ minotaur/fix-aaaa0001 ?');
-    expect(fixLabel(withFix(view('failed', null)), findings[0]!).text).toBe('✗ not fixed');
-    expect(fixLabel(state(), findings[0]!).text).toBe('');
-  });
-});
-
-describe('fix keys', () => {
-  const fixing = { total: 1, index: 0, current: 'aaaa0001', steps: 0, costUsd: 0, phase: 'fixing' };
-
-  it('fixes the selected finding, and refuses a secret with the reason', () => {
-    expect(handleKey(state(), { sequence: 'f' }, 10).effect).toEqual({ type: 'fix', findings: [findings[0]] });
-    const secret = handleKey(state({ showNoise: true, cursor: 3 }), { sequence: 'f' }, 10);
-    expect(secret.effect).toBeUndefined();
-    expect(secret.state.message).toContain('rotate it');
-  });
-
-  it('runs one job at a time', () => {
-    const running = { fingerprint: findings[1]!.fingerprint, steps: 1, maxSteps: 30, tokens: 0, costUsd: 0, filesRead: [] };
-    expect(handleKey(state({ running }), { sequence: 'f' }, 10).state.message).toContain('A check is running');
-    expect(handleKey(state({ fixing }), { sequence: 't' }, 10).state.message).toContain('A fix is running');
-    expect(handleKey(state({ fixing }), { sequence: 'r' }, 10).effect).toBeUndefined();
-  });
-
-  it('stops a fix with Ctrl+C instead of quitting', () => {
-    expect(handleKey(state({ fixing }), { name: 'c', ctrl: true }, 10).effect).toEqual({ type: 'cancel' });
-  });
-
-  it('asks before fixing what is shown, leaving out what cannot be fixed, and treats only y as yes', () => {
-    const asked = handleKey(state({ showNoise: true }), { sequence: 'F' }, 10).state;
-    expect(asked.question).toEqual({ kind: 'batch', findings: findings.slice(0, 3) });
-    // The secret is shown, but it is not counted: F would not fix it.
-    expect(fixableShown(state({ showNoise: true }))).toHaveLength(3);
-    expect(fixableShown(state({ showNoise: true, minSeverity: 'high' }))).toHaveLength(2);
-    expect(handleKey(asked, { sequence: 'y' }, 10).effect).toEqual({ type: 'fix', findings: findings.slice(0, 3) });
-    expect(handleKey(asked, { name: 'return' }, 10).effect).toBeUndefined();
-    const checkpoint = state({ question: { kind: 'checkpoint', spentUsd: 10, capUsd: 10, fixed: 1, notFixed: 0, remaining: 2, current: 'aaaa0002' } });
-    expect(handleKey(checkpoint, { name: 'c', ctrl: true }, 10).effect).toEqual({ type: 'answer', go: false });
-    expect(handleKey(checkpoint, { sequence: 'y' }, 10).effect).toEqual({ type: 'answer', go: true });
-  });
-});
-
 describe('while the scan runs', () => {
   it('lets the list be browsed, and holds back what needs the whole scan', () => {
     const scanning = state({ scanning: true });
     expect(press(scanning, 'down', 'return').view).toBe('detail');
-    for (const name of ['t', 'f', 'm']) {
+    for (const name of ['t', 'm']) {
       const { state: after, effect } = handleKey(scanning, key(name), 10);
       expect(effect).toBeUndefined();
       expect(after.message).toMatch(/Still scanning/);
     }
-    expect(handleKey(scanning, { sequence: 'F' }, 10).state.question).toBeNull();
     expect(handleKey(scanning, key('r'), 10).effect).toBeUndefined();
     expect(handleKey(scanning, key('q'), 10).effect).toEqual({ type: 'quit' });
     expect(handleKey(state(), key('t'), 10).effect).toMatchObject({ type: 'triage' });

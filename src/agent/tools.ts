@@ -1,6 +1,5 @@
 /**
- * The tools the agents work with, all going through the confined workspace.
- * The triage agent only reads; the fix agent can also edit.
+ * The tools the triage agent works with, all going through the confined workspace.
  */
 
 import { tool, type ToolSet } from 'ai';
@@ -8,7 +7,6 @@ import { z } from 'zod';
 
 import { exploitVerdictSchema, triageVerdictSchema, type AssessmentMode } from '../core/index.js';
 
-import { fixSubmissionSchema } from './fix-schema.js';
 import { WorkspaceAccessError, type Workspace } from './workspace.js';
 
 /** Tool failures go back to the model as data, so a bad path costs a step rather than the run. */
@@ -70,31 +68,5 @@ export function triageTools(workspace: Workspace, mode: AssessmentMode = 'triage
             inputSchema: triageVerdictSchema,
             execute: async () => ({ received: true }),
           }),
-  };
-}
-
-export function fixTools(workspace: Workspace): ToolSet {
-  return {
-    ...readTools(workspace),
-    replace_in_file: tool({
-      description:
-        'Replace one exact piece of text in a file. oldText must occur exactly once: copy it from read_file output without the line-number prefixes, with enough surrounding lines to make it unique.',
-      inputSchema: z.object({
-        path: z.string().describe('Relative path, such as src/app.ts'),
-        oldText: z.string().min(1),
-        newText: z.string(),
-      }),
-      execute: ({ path, oldText, newText }) => guarded(() => workspace.replaceInFile(path, oldText, newText)),
-    }),
-    write_file: tool({
-      description: 'Write a whole file, creating it if missing. Use for a new file; edit an existing file with replace_in_file.',
-      inputSchema: z.object({ path: z.string(), content: z.string() }),
-      execute: ({ path, content }) => guarded(() => workspace.writeFile(path, content)),
-    }),
-    submit_fix: tool({
-      description: 'Submit the result. Call this exactly once, when the fix is complete or you decide it cannot be done safely.',
-      inputSchema: fixSubmissionSchema,
-      execute: async () => ({ received: true }),
-    }),
   };
 }

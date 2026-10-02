@@ -7,7 +7,6 @@
 import { severityRank, type Severity } from '../core/index.js';
 
 import { isClosed, type DecisionState } from '../decisions.js';
-import { fixRefusal, type FixStatus } from '../fix.js';
 import type { LocalFinding } from '../sources.js';
 import { refusalFor, type TriageResult } from '../triage.js';
 
@@ -19,36 +18,6 @@ export interface Running {
   costUsd: number;
   filesRead: string[];
 }
-
-/** A fix run in progress, one finding or several. */
-export interface Fixing {
-  total: number;
-  /** 0-based index of the finding being fixed. */
-  index: number;
-  /** The id of the finding being fixed, once it has started. */
-  current: string | null;
-  steps: number;
-  costUsd: number;
-  /** What it is doing now, such as "running trivy again". */
-  phase: string;
-}
-
-/** What became of a fix, for the detail page. */
-export interface FixView {
-  status: FixStatus;
-  branch: string | null;
-  commit: string | null;
-  summary: string | null;
-  notes: string[];
-  error: string | null;
-  /** The committed change, as a patch. */
-  diff: string | null;
-}
-
-/** A yes-or-no question in the footer. Every key answers it; only y is yes. */
-export type Question =
-  | { kind: 'batch'; findings: readonly LocalFinding[] }
-  | { kind: 'checkpoint'; spentUsd: number; capUsd: number; fixed: number; notFixed: number; remaining: number; current: string };
 
 /** What the model setup allows: where code would go, or why triage cannot run. */
 export type ModelStatus = { ok: true; destination: string; limits: string } | { ok: false; error: string };
@@ -77,10 +46,6 @@ export interface BrowserState {
   queue: readonly QueuedCheck[];
   /** Set while the person picks a decision for a finding, then types the reason. */
   marking: Marking | null;
-  fixing: Fixing | null;
-  /** Finished fixes, by fingerprint. */
-  fixes: ReadonlyMap<string, FixView>;
-  question: Question | null;
   message: string | null;
   /** Set while the scan runs: the list fills in as sources finish, and nothing that needs the whole scan can start. */
   scanning: boolean;
@@ -118,10 +83,7 @@ export type Effect =
   | { type: 'triage'; finding: LocalFinding; continueFrom?: TriageResult }
   | { type: 'cancel' }
   | { type: 'rescan' }
-  | { type: 'decide'; finding: LocalFinding; state: DecisionState | 'open'; reason: string }
-  | { type: 'fix'; findings: readonly LocalFinding[] }
-  /** The answer at the batch's checkpoint. */
-  | { type: 'answer'; go: boolean };
+  | { type: 'decide'; finding: LocalFinding; state: DecisionState | 'open'; reason: string };
 
 export interface Update {
   state: BrowserState;
@@ -139,8 +101,6 @@ export function initialState(options: {
   protectedPaths: ReadonlySet<string>;
   model: ModelStatus;
   results?: ReadonlyMap<string, TriageResult> | undefined;
-  /** Fixes on branches that are not merged yet, by fingerprint. */
-  fixes?: ReadonlyMap<string, FixView> | undefined;
   message?: string | null | undefined;
   scanning?: boolean | undefined;
 }): BrowserState {
@@ -161,9 +121,6 @@ export function initialState(options: {
     running: null,
     queue: [],
     marking: null,
-    fixing: null,
-    fixes: new Map(options.fixes ?? []),
-    question: null,
     message: options.message ?? null,
     scanning: options.scanning ?? false,
   };
@@ -200,13 +157,11 @@ export function refusalOf(state: BrowserState, finding: LocalFinding): string | 
 export function handleKey(state: BrowserState, key: Key, pageSize: number): Update {
   const cleared = state.message ? { ...state, message: null } : state;
   if (state.marking) return markKey(cleared, state.marking, key);
-  if (state.question) return questionKey(cleared, state.question, key);
   if (state.scanning) {
     const waiting = whileScanning(state, key);
     if (waiting) return { state: { ...cleared, message: waiting } };
   }
   if (key.ctrl && key.name === 'c') {
-    if (state.fixing) return { state: { ...cleared, message: 'Stopping the fix…' }, effect: { type: 'cancel' } };
     if (!state.running) return quit(cleared);
     const waiting = state.queue.length;
     const message = waiting > 0 ? `Stopping the check and clearing ${waiting} queued…` : 'Stopping the check…';
@@ -240,8 +195,6 @@ function listKey(state: BrowserState, key: Key, pageSize: number): Update {
       return selectedFinding(state) ? { state: { ...state, view: 'detail', detailScroll: 0 } } : { state };
     case 't':
       return startTriage(state, false);
-    case 'f':
-      return startFix(state);
     case 's':
       return { state: cycleSeverity(state) };
     case 'a':
@@ -254,8 +207,6 @@ function listKey(state: BrowserState, key: Key, pageSize: number): Update {
     case 'escape':
       return quit(state);
     default:
-      // Shift+G and Shift+F arrive as capital letters.
-      if (key.sequence === 'F') return askToFixShown(state);
       return key.sequence === 'G' ? { state: move(state, Infinity) } : { state };
   }
 }
@@ -284,8 +235,6 @@ function detailKey(state: BrowserState, key: Key, pageSize: number): Update {
       return startTriage(state, false);
     case 'd':
       return startTriage(state, true);
-    case 'f':
-      return startFix(state);
     case 'm':
       return startMarking(state);
     default:
@@ -346,57 +295,16 @@ function markKey(state: BrowserState, marking: Marking, key: Key): Update {
 }
 
 /**
- * Why a key has to wait for the scan, or null. Checks, fixes and marks need
- * every source in: until the secret scanner has run, the files a check must
- * never read are not known yet.
+ * Why a key has to wait for the scan, or null. Checks and marks need every
+ * source in: until the secret scanner has run, the files a check must never
+ * read are not known yet.
  */
 function whileScanning(state: BrowserState, key: Key): string | null {
   const name = key.name ?? key.sequence;
   if (name === 'r') return 'A scan is already running.';
-  const waits = ['t', 'f', 'F', 'm', ...(state.view === 'detail' ? ['d'] : [])];
-  if (name && waits.includes(name)) return 'Still scanning. Checks, fixes and marks can start once the scan finishes.';
+  const waits = ['t', 'm', ...(state.view === 'detail' ? ['d'] : [])];
+  if (name && waits.includes(name)) return 'Still scanning. Checks and marks can start once the scan finishes.';
   return null;
-}
-
-/** Why nothing else can start now, or null. One job runs at a time: a check or a fix. */
-function busy(state: BrowserState): string | null {
-  if (state.fixing) return 'A fix is running. Wait for it to finish, or press Ctrl+C to stop it.';
-  if (state.running) return 'A check is running. Wait for it to finish, or press Ctrl+C to stop it.';
-  return null;
-}
-
-function startFix(state: BrowserState): Update {
-  const finding = selectedFinding(state);
-  if (!finding) return { state };
-  const waiting = busy(state);
-  if (waiting) return { state: { ...state, message: waiting } };
-  const refusal = fixRefusal(finding, state.protectedPaths);
-  if (refusal) return { state: { ...state, message: `This finding can't be fixed here: ${refusal}.` } };
-  return { state: { ...state, detailScroll: 0 }, effect: { type: 'fix', findings: [finding] } };
-}
-
-/** The findings F would fix: every one shown that can be fixed here. */
-export function fixableShown(state: BrowserState): readonly LocalFinding[] {
-  return visibleFindings(state).filter((finding) => fixRefusal(finding, state.protectedPaths) === null);
-}
-
-function askToFixShown(state: BrowserState): Update {
-  const waiting = busy(state);
-  if (waiting) return { state: { ...state, message: waiting } };
-  const findings = fixableShown(state);
-  if (findings.length === 0) return { state: { ...state, message: 'No finding shown can be fixed here.' } };
-  return { state: { ...state, question: { kind: 'batch', findings } } };
-}
-
-/** y is yes; any other key, Ctrl+C and esc included, is no. */
-function questionKey(state: BrowserState, question: Question, key: Key): Update {
-  const yes = (key.name ?? key.sequence) === 'y' || key.sequence === 'Y';
-  const cleared = { ...state, question: null };
-  if (question.kind === 'checkpoint') {
-    return { state: { ...cleared, message: yes ? null : 'Stopping at the cap…' }, effect: { type: 'answer', go: yes } };
-  }
-  if (!yes) return { state: { ...cleared, message: 'Nothing was fixed.' } };
-  return { state: cleared, effect: { type: 'fix', findings: question.findings } };
 }
 
 /** The list after a decision changed the findings: on the same finding when it is still shown. */
@@ -434,7 +342,6 @@ function refilter(before: BrowserState, after: BrowserState): BrowserState {
 function startTriage(state: BrowserState, deeper: boolean): Update {
   const finding = selectedFinding(state);
   if (!finding) return { state };
-  if (state.fixing) return { state: { ...state, message: busy(state)! } };
   if (state.running?.fingerprint === finding.fingerprint) {
     return { state: { ...state, message: `${finding.id} is being checked now; Ctrl+C stops it.` } };
   }
@@ -488,7 +395,6 @@ export function nextCheck(state: BrowserState): Update {
 
 /** A check reads the files the scan saw, so a new scan waits until no check runs or waits. */
 function rescan(state: BrowserState): Update {
-  if (state.fixing) return { state: { ...state, message: busy(state)! } };
   if (state.running) {
     return { state: { ...state, message: 'A check is running. Wait for it to finish, or press Ctrl+C to stop it, then press r again.' } };
   }

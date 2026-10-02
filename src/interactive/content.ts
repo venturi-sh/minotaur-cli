@@ -10,7 +10,7 @@ import { locationOf, toolsOf } from '../output.js';
 import { DECISION_LABEL, type Decision } from '../decisions.js';
 import type { LocalFinding } from '../sources.js';
 import type { TriageResult } from '../triage.js';
-import { MARK_KEYS, queuePosition, refusalOf, visibleFindings, type BrowserState, type FixView, type Marking, type Question } from './state.js';
+import { MARK_KEYS, queuePosition, refusalOf, visibleFindings, type BrowserState, type Marking } from './state.js';
 
 export interface Segment {
   text: string;
@@ -175,96 +175,7 @@ export function detailLines(state: BrowserState, width: number): Line[] {
   section('Exploitability');
   lines.push(...exploitabilityLines(state, finding, width));
 
-  const fixing = state.fixing?.current === finding.id ? state.fixing : null;
-  const fix = state.fixes.get(finding.fingerprint);
-  if (fixing || fix) {
-    section('Fix');
-    if (fixing) lines.push({ spinner: `${fixing.phase}${fixing.steps > 0 ? ` · step ${fixing.steps}` : ''}${fixing.costUsd > 0 ? ` · $${fixing.costUsd.toFixed(2)}` : ''}` });
-    else if (fix) addFix(fix, width, lines, para, field);
-  }
   return lines;
-}
-
-export const FIX_LABEL: Record<FixView['status'], { text: string; color: string }> = {
-  fixed: { text: 'Fixed', color: 'green' },
-  committed_unverified: { text: 'Committed, not verified', color: 'yellow' },
-  unverified: { text: 'Not committed: no scanner could verify it', color: 'yellow' },
-  failed: { text: 'Not fixed', color: 'red' },
-  gave_up: { text: 'Gave up', color: 'red' },
-  stopped_at_limit: { text: 'Stopped at the limit', color: 'red' },
-  stopped_at_cap: { text: 'Stopped at the batch cap', color: 'yellow' },
-  not_tried: { text: 'Not tried', color: 'gray' },
-  skipped: { text: 'Skipped', color: 'gray' },
-};
-
-/**
- * The FIX column. Kept apart from the check: a finding can be checked and
- * fixed, or only one of them, in either order.
- */
-export function fixLabel(state: BrowserState, finding: LocalFinding): CheckLabel {
-  if (state.fixing?.current === finding.id) return { text: 'fixing', color: ACCENT, running: true };
-  const fix = state.fixes.get(finding.fingerprint);
-  if (!fix) return { text: '' };
-  const branch = fix.branch ?? 'branch';
-  switch (fix.status) {
-    case 'fixed':
-      return fix.commit ? { text: `⎇ ${branch}`, color: 'green', bold: true } : { text: 'edited', color: 'green', bold: true };
-    case 'committed_unverified':
-      return fix.commit ? { text: `⎇ ${branch} ?`, color: 'yellow' } : { text: 'edited, not verified', color: 'yellow' };
-    case 'unverified':
-      return { text: '? not verified', color: 'yellow' };
-    case 'skipped':
-      return { text: "– can't fix", dim: true };
-    case 'not_tried':
-    case 'stopped_at_cap':
-      return { text: '· not tried', dim: true };
-    default:
-      return { text: '✗ not fixed', color: 'red' };
-  }
-}
-
-/** The outcome, where the commit is, and the patch with its added and removed lines colored. Added to `lines`. */
-function addFix(
-  fix: FixView,
-  width: number,
-  lines: Line[],
-  para: (value: string, style?: Omit<Segment, 'text'>, indent?: string) => void,
-  field: (label: string, value: string) => void,
-): void {
-  const label = FIX_LABEL[fix.status];
-  lines.push({ segments: [{ text: label.text, bold: true, color: label.color }] });
-  if (fix.branch) field('Branch', fix.branch);
-  if (fix.commit) field('Commit', fix.commit.slice(0, 12));
-  if (fix.summary) para(fix.summary);
-  for (const note of fix.notes) para(`• ${note}`, { dim: true }, '  ');
-  if (fix.error) para(fix.error, { color: 'red' });
-  if (!fix.diff) return;
-  lines.push(blank);
-  const patch = fix.diff.split('\n');
-  for (const line of patch.slice(0, 400)) {
-    const color = line.startsWith('+') && !line.startsWith('+++') ? 'green' : line.startsWith('-') && !line.startsWith('---') ? 'red' : line.startsWith('@@') ? 'cyan' : undefined;
-    lines.push({ segments: [{ text: line.slice(0, width), ...(color ? { color } : { dim: true }) }] });
-  }
-  if (patch.length > 400) lines.push(text(`… ${patch.length - 400} more lines; git show ${fix.commit?.slice(0, 12) ?? ''}`, { dim: true }));
-}
-
-/** The yes-or-no question in the footer. */
-export function questionPrompt(question: Question): Segment[] {
-  const ask = (words: string): Segment[] => [
-    { text: words, bold: true },
-    { text: '  y', bold: true, color: ACCENT },
-    { text: ' yes   ', dim: true },
-    { text: 'any other key', bold: true, color: ACCENT },
-    { text: ' no', dim: true },
-  ];
-  if (question.kind === 'batch') {
-    const count = question.findings.length;
-    return ask(`Fix ${count === 1 ? 'the 1 finding' : `all ${count} findings`} shown in the working tree? Nothing is committed.`);
-  }
-  return [
-    { text: `Spent $${question.spentUsd.toFixed(2)} of $${question.capUsd.toFixed(2)}: ${question.fixed} fixed, ${question.notFixed} not, ${question.remaining} to go.  `, dim: true },
-    ...ask(`Continue ${question.current} and spend up to as much again?`),
-  ];
 }
 
 function exploitabilityLines(state: BrowserState, finding: LocalFinding, width: number): Line[] {

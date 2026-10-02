@@ -5,7 +5,6 @@
  *   minotaur triage ID [PATH]       decide whether one finding is exploitable
  *   minotaur brief ID [PATH]        the commit, the files to read, and how to answer
  *   minotaur verdict ID [PATH]      store an answer an agent worked out itself
- *   minotaur fix ID... [PATH]       fix findings on a new branch, checked by a rescan
  *   minotaur mark ID STATE [PATH]   record a person's decision about a finding
  *   minotaur config [PATH]          choose scanners and a model, and write .minotaur.yml
  *   minotaur auth login [PROVIDER]  sign in to Anthropic or OpenAI, when no API key is set
@@ -36,7 +35,6 @@ import {
   PLAIN,
   readFindingsFile,
   renderFindingTable,
-  renderFixRun,
   renderSourceOutcome,
   renderSummary,
   renderTriageResult,
@@ -66,7 +64,6 @@ import {
   loadEarlierCheck,
   refusalFor,
   runTriage,
-  toSubject,
   type RunTriageOptions,
   type TriageLimits,
   type TriageResult,
@@ -87,32 +84,9 @@ import {
 } from './decisions.js';
 import { CommitError, describeCommit, resolveTarget, stillCommitted, targetNotes, treeFor, type Target } from './commit.js';
 import { agentIdentity, buildBrief, reviewVerdict } from './review.js';
-import { agentFixInstructions, renderFixRequest, type EarlierCheck } from './agent/index.js';
-import { protectedReason } from './core/index.js';
-import { planUpgrade } from './upgrade.js';
-import { runFixes, upgradeVersion, verifyAgentFix, type Checkpoint, type FixEvent, type FixResult } from './fix.js';
-import {
-  closeFixBranch,
-  DEFAULT_BRANCH,
-  discardChanges,
-  commitDiff,
-  existingFixBranch,
-  fixedOnBranch,
-  openFixBranch,
-  pendingFixes,
-  readClaim,
-  uncommittedDiff,
-  workingCopy,
-  WorktreeError,
-  writeClaim,
-} from './worktree.js';
-import type { FixView } from './interactive/state.js';
 
 // From package.json, so a release cannot report the wrong version.
 const VERSION = packageJson.version;
-
-/** What a run of several fixes may spend before Minotaur asks whether to go on. */
-const DEFAULT_MAX_TOTAL_USD = 10;
 
 const HELP = `minotaur ${VERSION}
 
@@ -122,8 +96,6 @@ Usage:
   minotaur triage ID [PATH] [options]     Ask a model whether one finding is exploitable
   minotaur brief ID [PATH] [options]      What to read, and how to judge one finding
   minotaur verdict ID [PATH] [options]    Store an answer you worked out yourself
-  minotaur fix ID... [PATH] [options]     Fix findings on a new branch, and check each
-  minotaur fix --all [PATH] [options]     fix by running the scanner again
   minotaur mark ID DECISION [PATH]        Record your own decision about a finding:
                                           false-positive, accepted-risk, fixed, confirmed,
                                           or open to remove it
@@ -174,16 +146,6 @@ To find exploitable vulnerabilities without a model key, an agent does this:
      the quotes did not match the files: fix the quotes and submit again.
   4. minotaur scan [PATH] --json    is the report. "check.exploitability" is the answer.
 
-To fix a finding without a model key, an agent does this:
-  1. minotaur brief ID [PATH] --fix --json
-     Edit files only in the "tree" directory: a worktree on its own branch.
-     "finding" and "instructions" say what to change; "notes" may say that
-     Minotaur can do it alone, such as a dependency upgrade.
-  2. The "verify" command, with --message saying what changed. Exit code 0
-     means the scanner no longer reports it and the fix is committed; exit 1
-     and "verification.problems" say what to change before verifying again.
-  3. To give up, the "discard" command removes the worktree.
-
 triage:
   --findings FILE        Read findings from "scan --json" output instead of re-running sources
   --model PROVIDER:MODEL anthropic:claude-sonnet-5, openai:gpt-5.4, or
@@ -202,47 +164,12 @@ triage:
 brief:
   --json                 Write the brief as JSON: commit, tree, finding, instructions,
                          the verdict schema, and the command to submit
-  --fix                  Brief for fixing the finding instead: a worktree to edit,
-                         and the commands to verify or discard the fix
   --findings FILE        Read findings from "scan --json" instead of scanning
 
 verdict:
   --file PATH            Read the verdict JSON from a file instead of stdin
   --agent NAME           Who answered, recorded as agent:NAME (default agent)
   --json                 Write the stored answer as JSON
-  --findings FILE        Read findings from "scan --json" instead of scanning
-
-fix:
-  Edits the files in the working tree, on the current branch, and does not
-  commit. A fix stays only when the scanners that reported the finding run
-  again and no longer report it, report nothing as severe in the changed files,
-  and the change does not silence them. A fix that fails is undone. It gets one
-  more attempt first. A finding already gone from the working tree is skipped.
-  Code and configuration are fixed by the model. A dependency with a known fixed
-  version is upgraded by npm, pnpm, go, cargo, or in a pinned requirements file,
-  without a model; the model changes the manifest when that is not possible, and
-  the package manager then updates the lockfile. Secrets are never fixed.
-  To give a PATH with several ids, put it last.
-  --all                  Fix every open finding "scan" lists: --focus (default
-                         maybe) and --min-severity choose which. Findings marked
-                         false positive, accepted risk or fixed are left out.
-  --max-total-usd N      Spend for the whole run before Minotaur asks whether to go
-                         on (default ${DEFAULT_MAX_TOTAL_USD} for several findings). Each "yes" allows N
-                         more. Without a terminal to ask, the run stops, with exit
-                         code 3; the same command again continues it.
-  --allow-unverified     Leave the edit even when no scanner can run again to check
-                         it, such as a finding read from a report file
-  --branch NAME          For "brief ID --fix" only: the worktree's branch,
-                         instead of minotaur/fixes
-  --force                For "brief ID --fix" only: start that branch again from
-                         the commit, dropping its earlier fixes
-  --verify               Check and commit what an agent changed after
-                         "brief ID --fix"; --message TEXT says what it changed,
-                         and --agent NAME who did it
-  --discard              Remove the worktree "brief ID --fix" made
-  --model, --base-url, --effort, --max-steps, --max-usd, --max-tokens
-                         As for triage. The limits apply to each finding.
-  --json                 Write the branch and a result for each finding as JSON
   --findings FILE        Read findings from "scan --json" instead of scanning
 
 mark:
@@ -267,7 +194,7 @@ auth:
   minotaur auth login anthropic
                          Sign in to the Claude Console with the ant command.
                          If ant is missing, Minotaur offers to install it.
-                         Triage and fix use that login when no API key is set.
+                         Triage uses that login when no API key is set.
   minotaur auth login openai
                          Ask for an OpenAI API key and store it outside the
                          repository. This is an API key, not a ChatGPT login.
@@ -311,14 +238,6 @@ const OPTIONS = {
   unchecked: { type: 'boolean' },
   file: { type: 'string' },
   agent: { type: 'string' },
-  force: { type: 'boolean' },
-  branch: { type: 'string' },
-  fix: { type: 'boolean' },
-  verify: { type: 'boolean' },
-  discard: { type: 'boolean' },
-  message: { type: 'string' },
-  'max-total-usd': { type: 'string' },
-  'allow-unverified': { type: 'boolean' },
   'no-browser': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'v' },
@@ -375,21 +294,6 @@ export async function main(argv: readonly string[]): Promise<number> {
     if (extra.length > 0) throw new UsageError('verdict takes a finding id and at most one path');
     return verdict(id, await repoRoot(path), values);
   }
-  if (command === 'fix' && (values.verify || values.discard)) {
-    const [id, path, ...extra] = rest;
-    if (!id || extra.length > 0) throw new UsageError(`fix --${values.verify ? 'verify' : 'discard'} takes one finding id and at most one path`);
-    if (values.verify && values.discard) throw new UsageError('--verify and --discard ask for different things; use one');
-    return values.verify ? verifyAgent(id, await repoRoot(path), values) : discardAgent(id, await repoRoot(path), values);
-  }
-  if (command === 'fix') {
-    if (values.all) {
-      if (rest.length > 1) throw new UsageError('fix --all takes at most one path, and no finding ids');
-      return fix(null, await repoRoot(rest[0]), values);
-    }
-    if (rest.length === 0) throw new UsageError('fix needs finding ids, or --all; run "minotaur scan" to list them');
-    const { ids, path } = await idsAndPath(rest);
-    return fix(ids, await repoRoot(path), values);
-  }
   if (command === 'auth') return auth(rest, values);
   if (command === 'config') {
     if (rest.length > 1) throw new UsageError('config takes at most one path');
@@ -398,8 +302,8 @@ export async function main(argv: readonly string[]): Promise<number> {
   throw new UsageError(`unknown command "${command}"; expected ${COMMAND_NAMES}`);
 }
 
-const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'fix', 'mark', 'auth', 'config']);
-const COMMAND_NAMES = 'scan, triage, brief, verdict, fix, mark, config or auth';
+const COMMANDS = new Set(['scan', 'triage', 'brief', 'verdict', 'mark', 'auth', 'config']);
+const COMMAND_NAMES = 'scan, triage, brief, verdict, mark, config or auth';
 
 /**
  * The first word is a command, or a directory to browse. `minotaur .` and
@@ -415,13 +319,6 @@ async function splitCommand(positionals: readonly string[]): Promise<{ command: 
   }
   if (rest.length > 0) throw new UsageError('minotaur takes at most one path');
   return { command: undefined, rest: [first] };
-}
-
-/** Several ids, then maybe a path. The last word is the path when it names a directory. */
-async function idsAndPath(words: readonly string[]): Promise<{ ids: string[]; path: string | undefined }> {
-  const last = words.at(-1)!;
-  const isDirectory = words.length > 1 && ((await stat(fromInvocation(last)).catch(() => null))?.isDirectory() ?? false);
-  return isDirectory ? { ids: words.slice(0, -1), path: last } : { ids: [...words], path: undefined };
 }
 
 /** Where the command was typed. Package scripts run from the package, and record the real place in INIT_CWD. */
@@ -607,17 +504,14 @@ async function scan(root: string, values: Values): Promise<number> {
   const noise = open.filter((finding) => finding.focus === 'noise').length - shown.filter((finding) => finding.focus === 'noise').length;
   const annotated = values.json || values.unchecked ? await annotate(where, collected, shown, config, values) : shown;
   const listed = values.unchecked ? annotated.filter((finding) => !hasAnswer(finding)) : annotated;
-  const pending = await pendingFixes(where.top, where.commit.sha);
-  const fixedOnBranches = listed.filter((finding) => pending.has(finding.fingerprint));
 
   if (values.json) {
-    const withFixes = listed.map((finding) => ({ ...finding, fix: pending.get(finding.fingerprint) ?? null }));
-    const file = toFindingsFile(root, where.commit.sha, withFixes, collected.sources, collected.protectedPaths);
+    const file = toFindingsFile(root, where.commit.sha, listed, collected.sources, collected.protectedPaths);
     process.stdout.write(`${JSON.stringify(file, null, 2)}\n`);
     return 0;
   }
   const style = process.stdout.isTTY ? COLOR : PLAIN;
-  process.stdout.write(`\n${renderFindingTable(listed, style, process.stdout.columns ?? 120, new Set(fixedOnBranches.map((finding) => finding.fingerprint)))}\n\n`);
+  process.stdout.write(`\n${renderFindingTable(listed, style, process.stdout.columns ?? 120)}\n\n`);
   const belowFocus = open.length - shown.length - noise;
   const focusNotes = [
     ...(closed > 0 ? [`${closed} marked false positive, accepted risk or fixed (--all shows them)`] : []),
@@ -628,11 +522,6 @@ async function scan(root: string, values: Values): Promise<number> {
   if (answered > 0) focusNotes.push(`${answered} already checked not shown (--unchecked hides them)`);
   process.stdout.write(`${renderSummary(listed, collected.findings.length - severe.length, collected.ignored, focusNotes)}\n`);
   process.stdout.write(style.dim(`On ${describeCommit(where.commit)}.\n`));
-  if (fixedOnBranches.length > 0) {
-    const branches = [...new Set(fixedOnBranches.map((finding) => pending.get(finding.fingerprint)!.branch))];
-    process.stdout.write(`${describeBranchFixes(fixedOnBranches.length, branches)}\n`);
-    for (const branch of branches) process.stdout.write(style.dim(`  git log -p ${where.commit.short}..${branch}    then    git merge ${branch}\n`));
-  }
   if (listed.some((finding) => finding.kind === 'sca' || finding.kind === 'sast')) {
     process.stdout.write(style.dim('Run "minotaur triage ID" to check whether a finding is exploitable.\n'));
   }
@@ -678,11 +567,8 @@ async function interactive(root: string, values: Values): Promise<number> {
     const reused = await loadChecks(checkCache, scopeOf(where), tree, collected.findings, model ? identityOf(model) : null, protectedPaths);
     const earlierResults = new Map([...reused].map(([fingerprint, check]) => [fingerprint, check.result]));
     for (const result of earlierResults.values()) reusedResults.add(result);
-    reporter.step('Looking for fixes on branches');
-    const onBranches = await fixesOnBranches(where, collected.findings);
     const notes = [
       ...targetNotes(where),
-      ...(onBranches.fixes.size > 0 ? [describeBranchFixes(onBranches.fixes.size, onBranches.branches)] : []),
       ...(collected.cachedAt ? [`From the scan ${describeAge(Date.now() - collected.cachedAt)}; press r to scan again.`] : []),
       ...(reused.size > 0 ? [`${reused.size} earlier check${reused.size === 1 ? '' : 's'} still appl${reused.size === 1 ? 'ies' : 'y'}.`] : []),
     ];
@@ -691,14 +577,11 @@ async function interactive(root: string, values: Values): Promise<number> {
       ignored: collected.ignored,
       protectedPaths,
       results: earlierResults,
-      fixes: onBranches.fixes,
       message: notes.length > 0 ? notes.join(' ') : null,
       commit: commitLabel(where),
     };
   };
 
-  let pendingFix: Promise<unknown> = Promise.resolve();
-  let appliedLocally = false;
   const session = await browse({
     root,
     commit: commitLabel(where),
@@ -728,50 +611,9 @@ async function interactive(root: string, values: Values): Promise<number> {
       protectedPaths = new Set(collected.protectedPaths);
       return { findings: collected.findings, protectedPaths, file: DECISIONS_FILE };
     },
-    fix: (findings, options) => {
-      const running = (async () => {
-        // A branch from an earlier fix of the same findings is continued, not refused.
-        const name = fixBranchName(values);
-        const scanned = decided(undecided!, await loadDecisions(root)).findings;
-        const run = await runFixes({
-          target: where,
-          findings,
-          scanned,
-          protectedPaths,
-          model,
-          noModel: status.ok ? undefined : status.error,
-          limits,
-          maxTotalUsd: positiveNumber(values['max-total-usd'], '--max-total-usd') ?? (findings.length > 1 ? DEFAULT_MAX_TOTAL_USD : undefined),
-          onCheckpoint: options.onCheckpoint,
-          sources: await sourcesFor(where, tree, values, config),
-          includeIgnored: values['include-ignored'] ?? false,
-          branch: name,
-          cache: cacheDir(),
-          allowUnverified: values['allow-unverified'] ?? false,
-          abortSignal: options.signal,
-          onEvent: options.onEvent,
-        });
-        const diffs = new Map<string, string>();
-        const copy = await workingCopy(where);
-        for (const result of run.results) {
-          const applied = result.status === 'fixed' || result.status === 'committed_unverified';
-          if (result.commit) diffs.set(result.finding.fingerprint, await commitDiff(where.top, result.commit).catch(() => ''));
-          else if (applied && result.changedFiles.length > 0) {
-            diffs.set(result.finding.fingerprint, await uncommittedDiff(copy, result.changedFiles).catch(() => ''));
-          }
-          if (applied) appliedLocally = true;
-        }
-        return { run, diffs };
-      })();
-      pendingFix = running.catch(() => undefined);
-      return running;
-    },
     input: process.stdin,
     output: process.stdout,
   });
-  // Quitting stops a fix, which then removes its worktree; wait for that before the process ends.
-  await pendingFix;
-  if (appliedLocally) process.stdout.write('Edits are in the working tree. Nothing was committed.\n');
 
   const results = session.filter((result) => !reusedResults.has(result));
   if (results.length > 0) {
@@ -783,49 +625,6 @@ async function interactive(root: string, values: Values): Promise<number> {
     }
   }
   return 0;
-}
-
-interface BranchFixes {
-  /** By fingerprint, for the findings of this scan. */
-  fixes: Map<string, FixView>;
-  /** The branches they are on, newest first. */
-  branches: string[];
-}
-
-/**
- * Fixes that are committed on `minotaur/` branches but not in the scanned
- * commit. The scan still reports these findings, since the code it scanned has
- * them; this is how a later run knows the work is done and waits for a merge.
- */
-async function fixesOnBranches(where: Target, findings: readonly LocalFinding[]): Promise<BranchFixes> {
-  const pending = await pendingFixes(where.top, where.commit.sha);
-  const fixes = new Map<string, FixView>();
-  const branches: string[] = [];
-  const diffs = new Map<string, string>();
-  for (const finding of findings) {
-    const fix = pending.get(finding.fingerprint);
-    if (!fix) continue;
-    if (!diffs.has(fix.commit)) diffs.set(fix.commit, await commitDiff(where.top, fix.commit).catch(() => ''));
-    if (!branches.includes(fix.branch)) branches.push(fix.branch);
-    fixes.set(finding.fingerprint, {
-      status: fix.verified ? 'fixed' : 'committed_unverified',
-      branch: fix.branch,
-      commit: fix.commit,
-      summary: `Fixed on branch ${fix.branch}${fix.by ? ` by ${fix.by}` : ''}, not merged yet.`,
-      notes: [],
-      error: null,
-      diff: diffs.get(fix.commit) || null,
-    });
-  }
-  return { fixes, branches };
-}
-
-function describeBranchFixes(count: number, branches: readonly string[]): string {
-  return `${count} finding${count === 1 ? ' has a fix' : 's have fixes'} on ${branches.length === 1 ? `branch ${branches[0]}` : `${branches.length} branches`}, not merged yet; merge ${branches.length === 1 ? 'it' : 'them'} to close ${count === 1 ? 'it' : 'them'}.`;
-}
-
-function fixBranchName(values: Values): string {
-  return values.branch?.trim() || DEFAULT_BRANCH;
 }
 
 function commitLabel(where: Target): string {
@@ -872,7 +671,7 @@ async function configuredIdentity(config: Config, values: Values): Promise<Check
 }
 
 /** The findings, the tree to read, and the files a check must not open. */
-async function openFindings(ids: readonly string[] | null, root: string, values: Values) {
+async function openFindings(ids: readonly string[], root: string, values: Values) {
   const { config } = await loadConfig(root);
   const file = values.findings ? await readFindingsFile(fromInvocation(values.findings)) : null;
   // Findings from "scan --json" belong to the commit they were scanned on.
@@ -885,23 +684,8 @@ async function openFindings(ids: readonly string[] | null, root: string, values:
   // Decisions may have changed since a findings file was written, so they are read again.
   const findings = file ? applyDecisions(file.findings, await loadDecisions(root)) : gathered.findings;
   const protectedPaths = liftProtected([...(file ? file.protectedPaths : gathered.protectedPaths), ...secretPaths(findings)], findings);
-  const picked = ids
-    ? [...new Map(ids.map((id) => resolveFinding(findings, id)).map((finding) => [finding.fingerprint, finding])).values()]
-    : openAndInFocus(findings, values);
-  return { config, where, tree: gathered.tree, protectedPaths, findings: picked, scanned: findings };
-}
-
-/** What `scan` lists by default, or with the same --focus and --min-severity: for `fix --all`. */
-function openAndInFocus(findings: readonly LocalFinding[], values: Values): LocalFinding[] {
-  const minimum = parseSeverity(values['min-severity']);
-  // For fix, --all means every finding, not every focus level as it does for scan.
-  const floor = parseFocus(values.focus, false) ?? 'maybe';
-  return findings.filter(
-    (finding) =>
-      !isClosed(finding) &&
-      focusRank(finding.focus ?? 'maybe') >= focusRank(floor) &&
-      (!minimum || severityRank(finding.severity) >= severityRank(minimum)),
-  );
+  const picked = [...new Map(ids.map((id) => resolveFinding(findings, id)).map((finding) => [finding.fingerprint, finding])).values()];
+  return { config, where, tree: gathered.tree, protectedPaths, findings: picked };
 }
 
 /** The finding, the tree to read, and the files a check must not open. */
@@ -1023,7 +807,6 @@ async function mark(id: string, stateName: string, root: string, values: Values)
 
 /** `minotaur brief ID`: the commit, where to read it, and how to judge the finding. */
 async function brief(id: string, root: string, values: Values): Promise<number> {
-  if (values.fix) return briefFix(id, root, values);
   const opened = await openFinding(id, root, values);
   const checks = await loadChecks(
     checkCacheDir(cacheDir()),
@@ -1043,126 +826,6 @@ async function brief(id: string, root: string, values: Values): Promise<number> 
     ...(earlier?.status === 'succeeded' && earlier.exploitability && earlier.rationale ? { earlier } : {}),
   });
   process.stdout.write(`${JSON.stringify(built, null, 2)}\n`);
-  return 0;
-}
-
-/**
- * `minotaur brief ID --fix`: a worktree for an agent to fix the finding in,
- * and how. Run again, it returns the same worktree with the edits so far.
- */
-async function briefFix(id: string, root: string, values: Values): Promise<number> {
-  const { finding, where, protectedPaths } = await openFinding(id, root, values);
-  if (!finding.location) throw new Error('the scanner gave no file for this finding, so there is nothing to edit');
-  const name = fixBranchName(values);
-  const cache = cacheDir();
-  let branch = await existingFixBranch(where, name, cache).catch(() => null);
-  // The worktree is shared: it is this finding's only while the agent works on it.
-  if (!branch || (await readClaim(branch.worktree))?.fingerprint !== finding.fingerprint) {
-    try {
-      branch = await openFixBranch(where, name, cache);
-    } catch (error) {
-      if (error instanceof WorktreeError) throw new UsageError(error.message);
-      throw error;
-    }
-    if ((await fixedOnBranch(branch)).has(finding.fingerprint)) {
-      await closeFixBranch(branch);
-      throw new UsageError(`branch ${name} already has a fix for ${finding.id}; review it with: git log -p ${where.commit.short}..${name}`);
-    }
-    await writeClaim(branch, { id: finding.id, fingerprint: finding.fingerprint });
-  }
-
-  const secret = finding.kind === 'secret' || protectedReason(finding.location.path, protectedPaths) !== null;
-  const guidance: string[] = [];
-  const notes: string[] = [];
-  if (finding.kind === 'sca' || finding.kind === 'license') {
-    const plan = await planUpgrade(branch.tree, finding, upgradeVersion(finding, [finding]));
-    if (plan.kind === 'command') notes.push(`Minotaur can make this upgrade itself with ${plan.manager}, without a model: minotaur fix ${finding.id} ${root}`);
-    if (plan.kind === 'model') guidance.push(plan.guidance);
-    if (plan.kind === 'unsupported') notes.push(plan.reason);
-    guidance.push('Update lockfiles only with the package manager, never by hand. Run it in the tree directory with its scripts turned off, such as npm install --ignore-scripts.');
-  }
-  if (secret) {
-    guidance.push(
-      finding.kind === 'secret'
-        ? 'This finding is a credential in the code. Do not print, copy, log or repeat its value anywhere. Replace it with a read from an environment variable or the secret store the project already uses, and remove the value from the file.'
-        : `${finding.location.path} also contains a credential. Do not print, copy, log or repeat it.`,
-    );
-    notes.push('The credential is still in the git history, so removing it from the code is not enough: rotate it.');
-  }
-  // A secret's snippet is the secret; it stays out of the brief.
-  const subject = toSubject(finding);
-  const shown = secret && subject.location ? { ...subject, location: { ...subject.location, snippet: undefined } } : subject;
-  const at = [finding.id, root, '--commit', where.commit.sha, ...(values.branch ? ['--branch', values.branch] : [])];
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        commit: where.commit,
-        branch: name,
-        tree: branch.tree,
-        finding: renderFixRequest(shown, undefined, guidance.join('\n') || undefined),
-        instructions: agentFixInstructions(),
-        notes,
-        verify: ['minotaur', 'fix', ...at, '--verify', '--message', '"WHAT YOU CHANGED"', '--json'].join(' '),
-        discard: ['minotaur', 'fix', ...at, '--discard'].join(' '),
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  return 0;
-}
-
-/** `minotaur fix ID --verify`: rescans an agent's edits in the worktree, and commits them when they pass. */
-async function verifyAgent(id: string, root: string, values: Values): Promise<number> {
-  const { config } = await loadConfig(root);
-  const opened = await openFinding(id, root, values);
-  const { finding, where } = opened;
-  const name = fixBranchName(values);
-  const branch = await existingFixBranch(where, name, cacheDir()).catch((error: Error) => {
-    throw new UsageError(error.message);
-  });
-  const claim = branch ? await readClaim(branch.worktree) : null;
-  if (!branch || claim?.fingerprint !== finding.fingerprint) {
-    const other = claim ? ` The worktree of ${name} has the edits for ${claim.id}.` : '';
-    throw new UsageError(`there is no fix of ${finding.id} in progress; run "minotaur brief ${finding.id} ${root} --fix --json" first.${other}`);
-  }
-  const result = await verifyAgentFix({
-    branch,
-    finding,
-    scanned: opened.scanned,
-    sources: await sourcesFor(where, opened.tree, values, config),
-    includeIgnored: values['include-ignored'] ?? false,
-    allowUnverified: values['allow-unverified'] ?? false,
-    by: agentIdentity(values.agent).model,
-    summary: values.message?.trim() || `Fixed ${finding.title}.`,
-    managed: { onDownload: info },
-    onEvent: fixReporter(),
-  });
-  const committed = result.commit !== null;
-  if (values.json) {
-    process.stdout.write(`${JSON.stringify({ ...result, tree: committed ? null : branch.tree }, null, 2)}\n`);
-  } else if (committed) {
-    process.stdout.write(`\n${renderFixRun({ branch: name, results: [result], interrupted: false, stoppedAtCap: false, alreadyOnBranch: 0 }, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN)}\n`);
-  } else {
-    process.stdout.write(`\n${finding.id} is not fixed yet:\n${(result.verification?.problems ?? [result.error ?? 'unknown']).map((problem) => `  - ${problem}`).join('\n')}\n`);
-    process.stdout.write(`The edits are still in ${branch.tree}. Change them and verify again, or remove them with --discard.\n`);
-  }
-  return committed ? 0 : 1;
-}
-
-/** `minotaur fix ID --discard`: removes an agent's worktree, and its branch when nothing was committed on it. */
-async function discardAgent(id: string, root: string, values: Values): Promise<number> {
-  const { finding, where } = await openFinding(id, root, values);
-  const name = fixBranchName(values);
-  const branch = await existingFixBranch(where, name, cacheDir()).catch(() => null);
-  const claim = branch ? await readClaim(branch.worktree) : null;
-  if (!branch || claim?.fingerprint !== finding.fingerprint) {
-    process.stdout.write(`There is no fix of ${finding.id} in progress.\n`);
-    return 0;
-  }
-  await discardChanges(branch);
-  const { kept } = await closeFixBranch(branch);
-  process.stdout.write(kept ? `Removed the edits for ${finding.id}; branch ${name} keeps its earlier fixes.\n` : `Removed the edits for ${finding.id} and the empty branch ${name}.\n`);
   return 0;
 }
 
@@ -1191,135 +854,6 @@ async function verdict(id: string, root: string, values: Values): Promise<number
   }
   await saveCheck(checkCacheDir(cacheDir()), scopeOf(opened.where), reviewed.result, [], by);
   return writeTriageResult(reviewed.result, values);
-}
-
-/** `minotaur fix ID...` or `minotaur fix --all`: fix findings on a new branch, one commit each. */
-async function fix(ids: readonly string[] | null, root: string, values: Values): Promise<number> {
-  const { config } = await loadConfig(root);
-  // Package manager upgrades need no model, so a missing one only fails the fixes that do.
-  let model: ResolvedModel | null = null;
-  let noModel: string | undefined;
-  try {
-    model = await resolveModel(modelFlags(values), config, process.env);
-  } catch (error) {
-    noModel = (error as Error).message;
-  }
-  const limits = triageLimits(values, config);
-  const opened = await openFindings(ids, root, values);
-  const { where, findings } = opened;
-  if (findings.length === 0) {
-    process.stdout.write(values.json ? `${JSON.stringify({ base: where.commit.sha, branch: null, results: [] }, null, 2)}\n` : 'Nothing to fix.\n');
-    return 0;
-  }
-  const sources = await sourcesFor(where, opened.tree, values, config);
-  const checks = await loadChecks(checkCacheDir(cacheDir()), scopeOf(where), opened.tree, findings, model ? identityOf(model) : null, opened.protectedPaths);
-  const earlier = new Map<string, EarlierCheck>();
-  for (const finding of findings) {
-    const check = checks.get(finding.fingerprint)?.result;
-    if (check?.status === 'succeeded' && check.exploitability && check.rationale) earlier.set(finding.fingerprint, earlierFrom(check, finding, 'the earlier check'));
-  }
-  const branch = fixBranchName(values);
-  const maxTotalUsd = positiveNumber(values['max-total-usd'], '--max-total-usd') ?? (findings.length > 1 ? DEFAULT_MAX_TOTAL_USD : undefined);
-  const again = ['minotaur', 'fix', ...(ids ?? ['--all']), root, '--commit', where.commit.sha].join(' ');
-  const copy = await workingCopy(where);
-
-  info(`\nFixing ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} in the working tree, on ${copy.name}. Nothing is committed.`);
-  if (model) {
-    info(`Code is sent to ${describeModel(model)}.`);
-    info(`Limits for each finding: ${describeLimits(model, limits)}.${maxTotalUsd ? ` Minotaur asks before the run spends more than $${maxTotalUsd}.` : ''}`);
-  } else {
-    info('No model is configured, so only dependencies with a known fixed version can be upgraded.');
-  }
-
-  const controller = new AbortController();
-  const stop = () => controller.abort();
-  process.once('SIGINT', stop);
-  const canAsk = !values.json && process.stdin.isTTY && process.stderr.isTTY;
-  try {
-    const run = await runFixes({
-      target: where,
-      findings,
-      scanned: opened.scanned,
-      protectedPaths: opened.protectedPaths,
-      model,
-      noModel,
-      limits,
-      maxTotalUsd,
-      onCheckpoint: canAsk ? (checkpoint) => askToContinue(checkpoint, maxTotalUsd!, controller.signal) : undefined,
-      sources,
-      includeIgnored: values['include-ignored'] ?? false,
-      branch,
-      cache: cacheDir(),
-      force: values.force ?? false,
-      allowUnverified: values['allow-unverified'] ?? false,
-      earlier,
-      managed: { onDownload: info },
-      abortSignal: controller.signal,
-      onEvent: fixReporter(),
-    });
-    const unfinished = run.stoppedAtCap || run.interrupted;
-    if (values.json) {
-      process.stdout.write(`${JSON.stringify({ base: where.commit.sha, ...run, continue: unfinished ? again : null }, null, 2)}\n`);
-    } else {
-      process.stdout.write(`\n${renderFixRun(run, where.commit.sha, process.stdout.isTTY ? COLOR : PLAIN, unfinished ? again : null)}\n`);
-    }
-    if (run.stoppedAtCap) return 3;
-    // With --all, what cannot be fixed here, such as a secret, is expected; with named ids it is a failure.
-    const done = (result: FixResult) => result.status === 'fixed' || result.status === 'committed_unverified' || (!ids && result.status === 'skipped');
-    return run.results.every(done) && !run.interrupted ? 0 : 1;
-  } catch (error) {
-    if (error instanceof WorktreeError) throw new UsageError(error.message);
-    throw error;
-  } finally {
-    process.removeListener('SIGINT', stop);
-  }
-}
-
-/** The checkpoint at the batch's cap, as a question on the terminal. Ctrl-C, or anything but yes, stops. */
-async function askToContinue(checkpoint: Checkpoint, cap: number, signal: AbortSignal): Promise<boolean> {
-  const count = (statuses: readonly string[]) => checkpoint.results.filter((result) => statuses.includes(result.status)).length;
-  const fixed = count(['fixed', 'committed_unverified']);
-  const notFixed = checkpoint.results.length - fixed;
-  info(`\nThe run has spent $${checkpoint.spentUsd.toFixed(2)} of $${checkpoint.capUsd.toFixed(2)}.`);
-  info(`  ${fixed} fixed, ${notFixed} not fixed, ${checkpoint.remaining} not started.`);
-  info(`  In progress: ${checkpoint.current.id} ${checkpoint.current.title}`);
-  const { createInterface } = await import('node:readline/promises');
-  const prompt = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    const answer = await prompt.question(`Continue for up to $${cap.toFixed(2)} more? [y/N] `, { signal });
-    return /^y(es)?$/i.test(answer.trim());
-  } catch {
-    return false;
-  } finally {
-    prompt.close();
-  }
-}
-
-/** Progress of a fix run as plain lines on stderr. */
-function fixReporter(): (event: FixEvent) => void {
-  return (event) => {
-    if (event.type === 'start') {
-      const count = event.total > 1 ? ` (${event.index + 1} of ${event.total})` : '';
-      info(`\n${event.finding.id}${count}: ${event.finding.title}`);
-    } else if (event.type === 'step') {
-      const { progress } = event;
-      const tokens = (progress.inputTokens + progress.outputTokens).toLocaleString('en-US');
-      const cost = progress.costUsd > 0 ? `, $${progress.costUsd.toFixed(2)}` : '';
-      const edited = progress.changedFiles.length > 0 ? `, edited ${progress.changedFiles.join(', ')}` : '';
-      info(`  step ${progress.steps} of at most ${event.maxSteps}: ${tokens} tokens so far${cost}${edited}`);
-    } else if (event.type === 'upgrade') {
-      info(`  ${event.description}`);
-    } else if (event.type === 'already_fixed') {
-      info(`${event.count} already fixed on the branch.`);
-    } else if (event.type === 'discarded') {
-      info(`Dropped uncommitted edits on ${event.branch}${event.findingId ? ` for ${event.findingId}` : ''}.`);
-    } else if (event.type === 'verify') {
-      info(event.scanners.length > 0 ? `  running ${event.scanners.join(', ')} again` : '  no scanner can run again to check this fix');
-    } else if (event.type === 'retry') {
-      info('  not fixed yet, trying again:');
-      for (const problem of event.problems) info(`    ${problem}`);
-    }
-  };
 }
 
 async function readStdin(): Promise<string> {

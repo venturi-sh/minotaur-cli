@@ -10,7 +10,6 @@ import { z } from 'zod';
 
 import { decisionSchema, isClosed } from './decisions.js';
 import type { LocalFinding, SourceOutcome } from './sources.js';
-import type { FixRun, FixStatus } from './fix.js';
 import { refusalFor, type TriageResult } from './triage.js';
 
 export interface Style {
@@ -59,8 +58,8 @@ export function fit(text: string, width: number): string {
   return single.length <= width ? single.padEnd(width) : `${single.slice(0, Math.max(0, width - 1))}…`;
 }
 
-/** `onBranch` holds the fingerprints with a fix on a branch that is not merged yet. */
-export function renderFindingTable(findings: readonly LocalFinding[], style: Style, width = 120, onBranch: ReadonlySet<string> = new Set()): string {
+/** One line of findings. */
+export function renderFindingTable(findings: readonly LocalFinding[], style: Style, width = 120): string {
   if (findings.length === 0) return 'No findings.';
   const kindWidth = 6;
   const severityWidth = 8;
@@ -81,7 +80,7 @@ export function renderFindingTable(findings: readonly LocalFinding[], style: Sty
   ].join('  ');
   const rows = findings.map((finding) =>
     [
-      onBranch.has(finding.fingerprint) ? style.green('⎇') : isClosed(finding) ? style.dim('✓') : finding.focus === 'likely' ? style.yellow('!') : ' ',
+      isClosed(finding) ? style.dim('✓') : finding.focus === 'likely' ? style.yellow('!') : ' ',
       finding.id,
       style.severity(finding.severity, fit(finding.severity, severityWidth)),
       fit(finding.kind, kindWidth),
@@ -91,9 +90,8 @@ export function renderFindingTable(findings: readonly LocalFinding[], style: Sty
     ].join('  '),
   );
   const legend = [
-    ...(findings.some((finding) => finding.focus === 'likely' && !isClosed(finding) && !onBranch.has(finding.fingerprint)) ? [`${style.yellow('!')} likely an issue`] : []),
-    ...(findings.some((finding) => isClosed(finding) && !onBranch.has(finding.fingerprint)) ? ['✓ marked false positive, accepted risk or fixed'] : []),
-    ...(findings.some((finding) => onBranch.has(finding.fingerprint)) ? [`${style.green('⎇')} fixed on a branch, not merged yet`] : []),
+    ...(findings.some((finding) => finding.focus === 'likely' && !isClosed(finding)) ? [`${style.yellow('!')} likely an issue`] : []),
+    ...(findings.some((finding) => isClosed(finding)) ? ['✓ marked false positive, accepted risk or fixed'] : []),
   ];
   if (legend.length > 0) return [style.bold(header), ...rows, style.dim(legend.join('   '))].join('\n');
   return [style.bold(header), ...rows].join('\n');
@@ -173,60 +171,6 @@ export function usageLine(result: Pick<TriageResult, 'steps' | 'inputTokens' | '
   return `${result.steps} step${result.steps === 1 ? '' : 's'}, ${tokens}${cost}, ${result.model}`;
 }
 
-const FIX_LABEL: Record<FixStatus, string> = {
-  fixed: 'Fixed',
-  committed_unverified: 'Committed, not verified',
-  unverified: 'Not committed, no scanner could verify it',
-  failed: 'Not fixed',
-  gave_up: 'Gave up',
-  stopped_at_limit: 'Stopped at the limit',
-  stopped_at_cap: 'Stopped at the batch cap',
-  not_tried: 'Not tried',
-  skipped: 'Skipped',
-};
-
-/** The result of `minotaur fix`: what happened to each finding. Edits stay in the working tree. */
-export function renderFixRun(run: FixRun, base: string, style: Style, resume: string | null = null): string {
-  const applied = run.results.filter((result) => result.status === 'fixed' || result.status === 'committed_unverified');
-  const lines: string[] = [];
-  for (const result of run.results) {
-    const finding = result.finding;
-    const label = result.status === 'committed_unverified' && !result.commit ? 'Applied, not verified' : FIX_LABEL[result.status];
-    const colored = result.status === 'fixed' ? style.green(label) : applied.includes(result) ? style.yellow(label) : style.red(label);
-    lines.push(
-      `${style.bold(finding.id)}  ${style.severity(finding.severity as Severity, finding.severity)}  ${finding.title}${finding.location ? `  ${style.dim(locationOf(finding))}` : ''}`,
-      `  ${colored}${result.commit ? ` in ${result.commit.slice(0, 7)}` : ''}${result.attempts > 1 ? style.dim(` after ${result.attempts} attempts`) : ''}`,
-    );
-    if (result.summary) lines.push(...indent(result.summary).map((line) => (line ? `  ${line}` : line)));
-    if (result.error) lines.push(`    ${style.dim(result.error)}`);
-    if (result.notes.length > 0 && result.commit) lines.push(`    ${style.bold('For the reviewer')}`, ...result.notes.map((note) => `      - ${note}`));
-    if (result.steps > 0) lines.push(`    ${style.dim(usageLine(result))}`);
-    lines.push('');
-  }
-
-  const total = run.results.length;
-  const cost = run.results.reduce((sum, result) => sum + result.costUsd, 0);
-  const committed = applied.filter((result) => result.commit !== null);
-  if (run.branch && committed.length > 0) {
-    const done = `${committed.length} of ${total} finding${total === 1 ? '' : 's'} committed${cost > 0 ? `, $${cost.toFixed(2)}` : ''}`;
-    lines.push(
-      `${style.bold(done)} on branch ${style.bold(run.branch)}.`,
-      style.dim(`Review: git log -p ${base.slice(0, 7)}..${run.branch}`),
-      style.dim(`Merge:  git merge ${run.branch}`),
-    );
-  } else if (applied.length > 0) {
-    const done = `${applied.length} of ${total} finding${total === 1 ? '' : 's'} applied${cost > 0 ? `, $${cost.toFixed(2)}` : ''}`;
-    lines.push(`${style.bold(done)} in the working tree. Nothing was committed.`);
-  } else {
-    lines.push(`${style.bold(`0 of ${total} applied`)}. The working tree is unchanged.`);
-  }
-  if (run.alreadyOnBranch > 0) lines.push(style.dim(`${run.alreadyOnBranch} more ${run.alreadyOnBranch === 1 ? 'was' : 'were'} already fixed in the working tree.`));
-  if (run.stoppedAtCap) lines.push(style.yellow('Stopped at the spend cap for the run.'));
-  if (run.interrupted) lines.push(style.yellow('Stopped with Ctrl-C before every finding was tried.'));
-  if (resume) lines.push(`To continue, with the same options: ${resume}`);
-  return lines.join('\n');
-}
-
 function ageOf(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 1) return 'less than a minute ago';
@@ -264,11 +208,6 @@ export const findingsFileSchema = z.object({
           by: z.string(),
           age: z.string(),
         })
-        .nullable()
-        .optional(),
-      /** A fix on a `minotaur/` branch that the scanned commit does not have yet, or null. */
-      fix: z
-        .object({ branch: z.string(), commit: z.string(), by: z.string().nullable(), verified: z.boolean() })
         .nullable()
         .optional(),
     }),
