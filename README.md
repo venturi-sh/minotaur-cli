@@ -36,8 +36,8 @@ minotaur ~/code/shop                       # the same, in that repository
 minotaur scan ~/code/shop                  # list findings
 minotaur triage 3f9a1c2e ~/code/shop       # is this one exploitable?
 minotaur mark 3f9a1c2e false-positive --reason "Test fixture"
-minotaur fix 3f9a1c2e                      # fix it: one commit on the branch minotaur/fixes
-minotaur fix --all                         # fix everything scan lists, one commit each
+minotaur fix 3f9a1c2e                      # fix it in the working tree, without committing
+minotaur fix --all                         # fix everything scan lists, still without committing
 ```
 
 In the browser, press `t` to check a finding, `f` to fix it, `F` to fix all findings shown (the footer shows how many), `m`
@@ -62,12 +62,9 @@ are hidden. Dependencies are ranked with CISA's exploited list and EPSS scores.
 **Checks.** A model reads the code around a finding and answers exploitable, not exploitable
 or undetermined, and cites the code it used. Each check is capped at 30 steps and $3.
 
-**Fixes.** `fix` never changes your working tree. It works in a git worktree in the cache and
-commits each fix on one branch, `minotaur/fixes` (or the branch you name with `--branch`), one
-commit per fix. Every run adds to that branch and skips the findings it already has a fix for.
-When you have committed since, your new commit is merged into the branch first; if that merge
-conflicts, Minotaur stops and leaves it to you. `--force` starts the branch again. You review the
-branch and merge it. Until you do, `scan` and the browser show which findings have a fix waiting.
+**Fixes.** `fix` edits the working tree on the current branch and does not commit. A fix that
+passes stays as an uncommitted change; a fix that fails is undone. You review it with `git diff`
+and commit it yourself. A finding that is already gone from the working tree is skipped.
 
 - Code and configuration findings are fixed by the model. It can read and edit files, but not
   credential files, git files, scanner ignore files, lockfiles or Minotaur's own settings.
@@ -79,11 +76,11 @@ branch and merge it. Until you do, `scan` and the browser show which findings ha
 - Secrets are never fixed by the model. An agent can remove one with `brief ID --fix`, but you
   must rotate the credential, because git history still has it.
 
-A fix is committed only when the scanners that reported the finding run again and all of these
-are true: the finding is gone, the changed files have no new finding as severe, and the change
-does not silence the scanner (for example with `nosemgrep`). A fix that fails gets one more
-attempt, with the scanner's result. A finding from a report file cannot be rescanned, so its fix
-is not committed unless you add `--allow-unverified`.
+A fix stays only when the scanners that reported the finding run again and all of these are
+true: the finding is gone, the changed files have no new finding as severe, and the change does
+not silence the scanner (for example with `nosemgrep`). A fix that fails gets one more attempt,
+with the scanner's result. A finding from a report file cannot be rescanned, so its edit is
+undone unless you add `--allow-unverified`.
 
 Each finding has the same limits as a check. A run of several fixes also has a cap for the
 whole run, $10 by default (`--max-total-usd`). At the cap, Minotaur asks whether to spend as

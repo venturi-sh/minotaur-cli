@@ -10,7 +10,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 import type { Target } from './commit.js';
 
@@ -45,18 +45,28 @@ export async function branchExists(top: string, name: string): Promise<boolean> 
  * the findings came from; a branch that was already merged just moves forward.
  * A merge that conflicts is left for the person.
  *
- * The worktree is shared by every fix of the branch, and an agent's fix waits
- * in it between commands. Uncommitted edits there are never thrown away.
+ * The worktree is shared by every fix of the branch. `minotaur fix` drops
+ * uncommitted edits left by an interrupted run. `brief --fix` does not: an
+ * agent's edits wait there until verify or discard.
  */
-export async function openFixBranch(target: Target, name: string, cache: string, options: { force?: boolean } = {}): Promise<FixBranch> {
+export async function openFixBranch(
+  target: Target,
+  name: string,
+  cache: string,
+  options: { force?: boolean; discardEdits?: boolean; onDiscard?: (claim: Claim | null) => void } = {},
+): Promise<FixBranch> {
   const top = target.top;
   if ((await git(top, ['check-ref-format', '--branch', name])).code !== 0) throw new WorktreeError(`"${name}" is not a valid branch name`);
   const worktree = worktreeDir(top, name, cache);
   if ((await isWorktree(top, worktree)) && (await hasEdits(worktree))) {
     const claim = await readClaim(worktree);
-    const who = claim ? ` for finding ${claim.id}` : '';
-    const next = claim ? `run "minotaur fix ${claim.id} --verify" to commit them, or "minotaur fix ${claim.id} --discard"` : 'commit or remove them';
-    throw new WorktreeError(`branch ${name} has uncommitted edits${who} in ${join(worktree, target.prefix)}; ${next} first`);
+    if (!options.discardEdits) {
+      const who = claim ? ` for finding ${claim.id}` : '';
+      const next = claim ? `run "minotaur fix ${claim.id} --verify" to commit them, or "minotaur fix ${claim.id} --discard"` : 'commit or remove them';
+      throw new WorktreeError(`branch ${name} has uncommitted edits${who} in ${join(worktree, target.prefix)}; ${next} first`);
+    }
+    await rm(claimPath(worktree), { force: true });
+    options.onDiscard?.(claim);
   }
   // Left over from a run that was killed, or from an agent's fix that was committed or abandoned.
   await removeWorktree(top, worktree);
@@ -101,6 +111,57 @@ async function removeWorktree(top: string, worktree: string): Promise<void> {
   await git(top, ['worktree', 'remove', '--force', worktree]);
   await rm(worktree, { recursive: true, force: true });
   await git(top, ['worktree', 'prune']);
+}
+
+/** The checkout the person has open, so a fix edits that branch and does not make another. */
+export async function workingCopy(target: Target): Promise<FixBranch> {
+  const current = (await git(target.top, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
+  return {
+    name: current && current !== 'HEAD' ? current : 'HEAD',
+    base: target.commit.sha,
+    worktree: target.top,
+    tree: join(target.top, target.prefix),
+    top: target.top,
+  };
+}
+
+/**
+ * The uncommitted files, so a failed fix can put back only what it changed.
+ * A missing file is stored as null. A clean tree has an empty map.
+ */
+export async function snapshotTree(branch: FixBranch): Promise<Map<string, Buffer | null>> {
+  const files = new Map<string, Buffer | null>();
+  for (const path of await changedPaths(branch)) {
+    try {
+      files.set(path, await readFile(join(branch.tree, path)));
+    } catch {
+      files.set(path, null);
+    }
+  }
+  return files;
+}
+
+/** Puts the tree back to `before`. Files a fix created are removed, and files it edited go back. */
+export async function restoreTree(branch: FixBranch, before: ReadonlyMap<string, Buffer | null>): Promise<void> {
+  const paths = new Set([...(await changedPaths(branch)), ...before.keys()]);
+  for (const path of paths) {
+    const full = join(branch.tree, path);
+    if (before.has(path)) {
+      const content = before.get(path) ?? null;
+      if (content === null) await rm(full, { force: true });
+      else {
+        await mkdir(dirname(full), { recursive: true });
+        await writeFile(full, content);
+      }
+      continue;
+    }
+    const fromRoot = relative(branch.worktree, full);
+    if ((await git(branch.worktree, ['cat-file', '-e', `HEAD:${fromRoot}`])).code === 0) {
+      await must(branch.worktree, ['checkout', '-q', 'HEAD', '--', fromRoot], `could not restore ${fromRoot}`);
+    } else {
+      await rm(full, { force: true });
+    }
+  }
 }
 
 /** Where a branch's worktree is kept in the cache. */

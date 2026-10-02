@@ -111,22 +111,16 @@ async function run(overrides: Partial<RunFixesOptions> & { rescans?: CollectResu
 }
 
 describe('runFixes', () => {
-  it('commits a fix the rescan confirms, on its own branch', async () => {
+  it('applies a fix the rescan confirms, and does not commit it', async () => {
     const run1 = await run({});
-    expect(run1.branch).toBe('minotaur/fix-a1b2c3d4');
-    expect(run1.results[0]).toMatchObject({ status: 'fixed', attempts: 1, changedFiles: ['db.js'], error: null });
-    const message = git('log', '-1', '--format=%B', 'minotaur/fix-a1b2c3d4');
-    expect(message).toContain('fix(security): SQL injection');
-    expect(message).toContain('- Check callers pass a number.');
-    expect(message).toContain(`Minotaur-Finding: ${finding().fingerprint}`);
-    expect(git('show', 'minotaur/fix-a1b2c3d4:db.js')).toBe(`${SAFE}\n`);
-    // The person's working tree and branch are left as they were.
-    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${QUERY}\n`);
-    expect(git('rev-parse', '--abbrev-ref', 'HEAD').trim()).not.toBe('minotaur/fix-a1b2c3d4');
-    expect(git('worktree', 'list')).not.toContain(cache);
+    expect(run1.branch).toBeNull();
+    expect(run1.results[0]).toMatchObject({ status: 'fixed', attempts: 1, changedFiles: ['db.js'], commit: null, error: null });
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${SAFE}\n`);
+    expect(git('show', 'HEAD:db.js')).toBe(`${QUERY}\n`);
+    expect(git('branch', '--list', 'minotaur/*')).toBe('');
   });
 
-  it('tries again with what the scanner said, then commits', async () => {
+  it('tries again with what the scanner said, then leaves the edit', async () => {
     const narrowed = QUERY.replace('${id}', '${Number(id)}');
     const result = await run({
       model: model([
@@ -138,10 +132,10 @@ describe('runFixes', () => {
       rescans: [scanResult([finding()]), scanResult([])],
     });
     expect(result.results[0]).toMatchObject({ status: 'fixed', attempts: 2, summary: 'Parameterized the query.' });
-    expect(git('show', 'minotaur/fix-a1b2c3d4:db.js')).toBe(`${SAFE}\n`);
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${SAFE}\n`);
   });
 
-  it('rejects a fix that silences the scanner, and removes the empty branch', async () => {
+  it('rejects a fix that silences the scanner, and puts the file back', async () => {
     const silence = [
       toolCall('replace_in_file', { path: 'db.js', oldText: QUERY, newText: `${QUERY} // nosemgrep` }),
       toolCall('submit_fix', { outcome: 'fixed', summary: 'Done.' }),
@@ -150,7 +144,7 @@ describe('runFixes', () => {
     expect(result.branch).toBeNull();
     expect(result.results[0]).toMatchObject({ status: 'failed', attempts: 2, branch: null, commit: null });
     expect(result.results[0]!.error).toContain('silences the scanner');
-    expect(git('branch', '--list', 'minotaur/*')).toBe('');
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${QUERY}\n`);
   });
 
   it('rejects a fix that adds a finding as severe in a changed file', async () => {
@@ -181,57 +175,26 @@ describe('runFixes', () => {
       ]),
     });
     expect(result.results.map((item) => item.status)).toEqual(['fixed', 'gave_up']);
-    expect(git('rev-list', '--count', 'HEAD..minotaur/fixes-abc').trim()).toBe('1');
-    expect(git('show', 'minotaur/fixes-abc:other.js')).toBe('run();\n');
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${SAFE}\n`);
+    expect(await readFile(join(root, 'other.js'), 'utf8')).toBe('run();\n');
   });
 
-  it('continues an existing branch, skipping what it already fixed, and --force starts it again', async () => {
+  it('skips a finding an earlier edit already removed', async () => {
     expect((await run({})).results[0]!.status).toBe('fixed');
-    const again = await run({ model: model([]) });
+    const again = await run({ model: model([]), rescans: [scanResult([])] });
     expect(again).toMatchObject({ alreadyOnBranch: 1, results: [] });
-    expect(git('rev-list', '--count', 'HEAD..minotaur/fix-a1b2c3d4').trim()).toBe('1');
-    expect((await run({ force: true })).results[0]!.status).toBe('fixed');
-    expect(git('rev-list', '--count', 'HEAD..minotaur/fix-a1b2c3d4').trim()).toBe('1');
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${SAFE}\n`);
+    expect(git('show', 'HEAD:db.js')).toBe(`${QUERY}\n`);
   });
 
-  it('merges a newer commit into the branch before fixing', async () => {
-    const second = finding({ fingerprint: 'b2b2b2b2', location: { path: 'other.js', startLine: 1 } });
-    await run({ findings: [finding()], scanned: [finding(), second], rescans: [scanResult([second])] });
-    await writeFile(join(root, 'new.js'), 'added();\n');
-    git('add', '.');
-    git('commit', '-q', '-m', 'newer');
-    const result = await run({
-      findings: [second],
-      // The first rescan is of the branch as it is before this fix, which still has the finding.
-      rescans: [scanResult([second]), scanResult([])],
-      model: model([
-        toolCall('write_file', { path: 'other.js', content: 'safe();\n' }),
-        toolCall('submit_fix', { outcome: 'fixed', summary: 'Safe.' }),
-      ]),
-    });
-    expect(result.results[0]!.status).toBe('fixed');
-    // Both fixes, and the newer commit, are on the branch.
-    expect(git('show', 'minotaur/fix-a1b2c3d4:db.js')).toBe(`${SAFE}\n`);
-    expect(git('show', 'minotaur/fix-a1b2c3d4:other.js')).toBe('safe();\n');
-    expect(git('show', 'minotaur/fix-a1b2c3d4:new.js')).toBe('added();\n');
-  });
-
-  it('stops without losing anything when a newer commit conflicts with the branch', async () => {
-    await run({});
-    await writeFile(join(root, 'db.js'), 'changed differently();\n');
-    git('commit', '-q', '-am', 'conflicting');
-    await expect(run({ model: model([]) })).rejects.toThrow(/cannot take the changes of .*--force/);
-    expect(git('show', 'minotaur/fix-a1b2c3d4:db.js')).toBe(`${SAFE}\n`);
-    expect(git('worktree', 'list')).not.toContain('worktrees');
-  });
-
-  it('does not commit what no scanner can confirm, unless allowed', async () => {
+  it('puts the file back when no scanner can confirm, unless leaving the edit is allowed', async () => {
     const reportOnly: SourceConfig[] = [{ report: 'semgrep.sarif' }];
     const refused = await run({ sources: reportOnly });
     expect(refused.results[0]).toMatchObject({ status: 'unverified', commit: null });
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${QUERY}\n`);
     const allowed = await run({ sources: reportOnly, allowUnverified: true });
-    expect(allowed.results[0]!.status).toBe('committed_unverified');
-    expect(git('log', '-1', '--format=%B', 'minotaur/fix-a1b2c3d4')).toContain('Not verified');
+    expect(allowed.results[0]).toMatchObject({ status: 'committed_unverified', commit: null });
+    expect(await readFile(join(root, 'db.js'), 'utf8')).toBe(`${SAFE}\n`);
   });
 });
 
@@ -314,10 +277,9 @@ describe('dependency fixes', () => {
     const { calls, runTool } = recorder();
     const result = await run({ findings: [lodash()], sources: TRIVY, model: model([]), runTool, branch: 'minotaur/fix-10da5h00' });
     expect(calls).toEqual(['npm install lodash@4.17.19 --package-lock-only --ignore-scripts --no-audit --no-fund']);
-    expect(result.results[0]).toMatchObject({ status: 'fixed', model: 'npm', steps: 0, changedFiles: ['package-lock.json'] });
-    const message = git('log', '-1', '--format=%B', 'minotaur/fix-10da5h00');
-    expect(message).toContain('fix(deps): Prototype pollution in lodash');
-    expect(message).toContain('Minotaur-Fixed-By: npm');
+    expect(result.results[0]).toMatchObject({ status: 'fixed', model: 'npm', steps: 0, changedFiles: ['package-lock.json'], commit: null });
+    expect(await readFile(join(root, 'package-lock.json'), 'utf8')).toContain('lodash');
+    expect(git('show', 'HEAD:package-lock.json')).toBe('{}\n');
   });
 
   it.each([
@@ -337,7 +299,7 @@ describe('dependency fixes', () => {
     expect(calls).toEqual(['npm install --package-lock-only --ignore-scripts --no-audit --no-fund']);
     expect(result.results[0]!.status).toBe('fixed');
     expect(result.results[0]!.notes[0]).toContain('override forces every copy of it to 4.17.19');
-    const manifest = git('show', 'minotaur/fix-10da5h00:package.json');
+    const manifest = await readFile(join(root, 'package.json'), 'utf8');
     expect(JSON.parse(manifest).overrides).toEqual({ lodash: '4.17.19' });
     expect(manifest).toContain('\t"overrides"');
   });
@@ -347,7 +309,7 @@ describe('dependency fixes', () => {
     const flask = lodash({ location: { path: 'requirements.txt' }, package: { name: 'flask', version: '1.0', ecosystem: 'pip', fixedVersion: '2.2.5, 2.3.2' } });
     const result = await run({ findings: [flask], sources: TRIVY, model: model([]), branch: 'minotaur/fix-10da5h00' });
     expect(result.results[0]!.status).toBe('fixed');
-    expect(git('show', 'minotaur/fix-10da5h00:requirements.txt')).toBe('Flask==2.2.5  # web\nrequests>=2\n');
+    expect(await readFile(join(root, 'requirements.txt'), 'utf8')).toBe('Flask==2.2.5  # web\nrequests>=2\n');
   });
 
   it('hands the manifest to the model when the package manager refuses, then relocks', async () => {
@@ -366,7 +328,7 @@ describe('dependency fixes', () => {
     expect(calls).toEqual(['cargo update -p regex --precise 1.5.5', 'cargo update -p regex']);
     expect(result.results[0]).toMatchObject({ status: 'fixed', changedFiles: ['Cargo.lock', 'Cargo.toml'] });
     // The model's own write to the lockfile was refused; the tool wrote it.
-    expect(git('show', 'minotaur/fix-10da5h00:Cargo.lock')).toBe('regex 1.5.5\n');
+    expect(await readFile(join(root, 'Cargo.lock'), 'utf8')).toBe('regex 1.5.5\n');
   });
 
   it('skips a project whose lockfile Minotaur cannot update, without calling the model', async () => {
@@ -394,12 +356,8 @@ describe('dependency fixes', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]).toContain('lodash@4.17.21');
     expect(result.results.map((item) => item.status)).toEqual(['fixed', 'fixed']);
-    expect(result.results[1]!.summary).toContain(`commit ${result.results[0]!.commit!.slice(0, 7)}`);
-    expect(git('rev-list', '--count', 'HEAD..minotaur/fixes-abc').trim()).toBe('1');
-    // The one commit names both findings, so a later run shows both as fixed on the branch.
-    const message = git('log', '-1', '--format=%B', 'minotaur/fixes-abc');
-    expect(message).toContain(`Minotaur-Finding: ${lodash().fingerprint}`);
-    expect(message).toContain(`Minotaur-Finding: ${other.fingerprint}`);
+    expect(result.results[1]!.summary).toContain('this edit');
+    expect(git('rev-list', '--count', 'HEAD').trim()).toBe('2');
   });
 });
 
@@ -472,7 +430,8 @@ describe('batch cap', () => {
     expect(statuses).toContain('stopped_at_cap');
     expect(statuses.at(-1)).toMatch(/stopped_at_cap|not_tried/);
     expect(result.stoppedAtCap).toBe(true);
-    expect(result.branch).toBe('minotaur/fixes-abc');
+    expect(result.branch).toBeNull();
+    expect(await readFile(join(root, 'a.js'), 'utf8')).toBe('good();\n');
     const spent = result.results.reduce((sum, item) => sum + item.costUsd, 0);
     expect(spent).toBeLessThanOrEqual(0.16);
   });
@@ -493,6 +452,7 @@ describe('batch cap', () => {
     });
     expect(again.alreadyOnBranch).toBe(done);
     expect(again.results.map((item) => item.status)).toEqual(files.slice(done).map(() => 'fixed'));
-    expect(git('rev-list', '--count', 'HEAD..minotaur/fixes-abc').trim()).toBe(String(files.length));
+    for (const path of files) expect(await readFile(join(root, path), 'utf8')).toBe('good();\n');
+    expect(git('show', 'HEAD:a.js')).toBe('bad();\n');
   });
 });

@@ -101,6 +101,8 @@ import {
   openFixBranch,
   pendingFixes,
   readClaim,
+  uncommittedDiff,
+  workingCopy,
   WorktreeError,
   writeClaim,
 } from './worktree.js';
@@ -211,13 +213,11 @@ verdict:
   --findings FILE        Read findings from "scan --json" instead of scanning
 
 fix:
-  Each fix is made in a separate worktree and committed on one branch,
-  minotaur/fixes, one commit per fix. Every run adds to it, and skips findings
-  it already has a fix for. When the commit is newer than the branch, it is
-  merged into the branch first. Your working tree does not change. A fix is committed only when the scanners that
-  reported the finding run again and no longer report it, report nothing as
-  severe in the changed files, and the change does not silence them. A fix that
-  fails gets one more attempt.
+  Edits the files in the working tree, on the current branch, and does not
+  commit. A fix stays only when the scanners that reported the finding run
+  again and no longer report it, report nothing as severe in the changed files,
+  and the change does not silence them. A fix that fails is undone. It gets one
+  more attempt first. A finding already gone from the working tree is skipped.
   Code and configuration are fixed by the model. A dependency with a known fixed
   version is upgraded by npm, pnpm, go, cargo, or in a pinned requirements file,
   without a model; the model changes the manifest when that is not possible, and
@@ -230,11 +230,12 @@ fix:
                          on (default ${DEFAULT_MAX_TOTAL_USD} for several findings). Each "yes" allows N
                          more. Without a terminal to ask, the run stops, with exit
                          code 3; the same command again continues it.
-  --branch NAME          Commit on this branch instead of minotaur/fixes
-  --force                Start the branch again from the commit, dropping its
-                         earlier fixes
-  --allow-unverified     Commit a fix even when no scanner can run again to check
+  --allow-unverified     Leave the edit even when no scanner can run again to check
                          it, such as a finding read from a report file
+  --branch NAME          For "brief ID --fix" only: the worktree's branch,
+                         instead of minotaur/fixes
+  --force                For "brief ID --fix" only: start that branch again from
+                         the commit, dropping its earlier fixes
   --verify               Check and commit what an agent changed after
                          "brief ID --fix"; --message TEXT says what it changed,
                          and --agent NAME who did it
@@ -697,7 +698,7 @@ async function interactive(root: string, values: Values): Promise<number> {
   };
 
   let pendingFix: Promise<unknown> = Promise.resolve();
-  const fixBranches = new Set<string>();
+  let appliedLocally = false;
   const session = await browse({
     root,
     commit: commitLabel(where),
@@ -751,10 +752,15 @@ async function interactive(root: string, values: Values): Promise<number> {
           onEvent: options.onEvent,
         });
         const diffs = new Map<string, string>();
+        const copy = await workingCopy(where);
         for (const result of run.results) {
+          const applied = result.status === 'fixed' || result.status === 'committed_unverified';
           if (result.commit) diffs.set(result.finding.fingerprint, await commitDiff(where.top, result.commit).catch(() => ''));
+          else if (applied && result.changedFiles.length > 0) {
+            diffs.set(result.finding.fingerprint, await uncommittedDiff(copy, result.changedFiles).catch(() => ''));
+          }
+          if (applied) appliedLocally = true;
         }
-        if (run.branch) fixBranches.add(run.branch);
         return { run, diffs };
       })();
       pendingFix = running.catch(() => undefined);
@@ -765,7 +771,7 @@ async function interactive(root: string, values: Values): Promise<number> {
   });
   // Quitting stops a fix, which then removes its worktree; wait for that before the process ends.
   await pendingFix;
-  for (const branch of fixBranches) process.stdout.write(`Fixes are on branch ${branch}. Review: git log -p ${where.commit.short}..${branch}\n`);
+  if (appliedLocally) process.stdout.write('Edits are in the working tree. Nothing was committed.\n');
 
   const results = session.filter((result) => !reusedResults.has(result));
   if (results.length > 0) {
@@ -1214,9 +1220,10 @@ async function fix(ids: readonly string[] | null, root: string, values: Values):
   }
   const branch = fixBranchName(values);
   const maxTotalUsd = positiveNumber(values['max-total-usd'], '--max-total-usd') ?? (findings.length > 1 ? DEFAULT_MAX_TOTAL_USD : undefined);
-  const again = ['minotaur', 'fix', ...(ids ?? ['--all']), root, '--commit', where.commit.sha, ...(values.branch ? ['--branch', values.branch] : [])].join(' ');
+  const again = ['minotaur', 'fix', ...(ids ?? ['--all']), root, '--commit', where.commit.sha].join(' ');
+  const copy = await workingCopy(where);
 
-  info(`\nFixing ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} on branch ${branch}, from ${describeCommit(where.commit)}.`);
+  info(`\nFixing ${findings.length === 1 ? findings[0]!.id : `${findings.length} findings`} in the working tree, on ${copy.name}. Nothing is committed.`);
   if (model) {
     info(`Code is sent to ${describeModel(model)}.`);
     info(`Limits for each finding: ${describeLimits(model, limits)}.${maxTotalUsd ? ` Minotaur asks before the run spends more than $${maxTotalUsd}.` : ''}`);
@@ -1258,7 +1265,7 @@ async function fix(ids: readonly string[] | null, root: string, values: Values):
     }
     if (run.stoppedAtCap) return 3;
     // With --all, what cannot be fixed here, such as a secret, is expected; with named ids it is a failure.
-    const done = (result: FixResult) => result.commit !== null || (!ids && result.status === 'skipped');
+    const done = (result: FixResult) => result.status === 'fixed' || result.status === 'committed_unverified' || (!ids && result.status === 'skipped');
     return run.results.every(done) && !run.interrupted ? 0 : 1;
   } catch (error) {
     if (error instanceof WorktreeError) throw new UsageError(error.message);
@@ -1304,6 +1311,8 @@ function fixReporter(): (event: FixEvent) => void {
       info(`  ${event.description}`);
     } else if (event.type === 'already_fixed') {
       info(`${event.count} already fixed on the branch.`);
+    } else if (event.type === 'discarded') {
+      info(`Dropped uncommitted edits on ${event.branch}${event.findingId ? ` for ${event.findingId}` : ''}.`);
     } else if (event.type === 'verify') {
       info(event.scanners.length > 0 ? `  running ${event.scanners.join(', ')} again` : '  no scanner can run again to check this fix');
     } else if (event.type === 'retry') {

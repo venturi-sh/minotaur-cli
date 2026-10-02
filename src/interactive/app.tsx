@@ -102,7 +102,7 @@ export interface BrowseOptions {
   check: (finding: LocalFinding, options: CheckOptions) => Promise<TriageResult>;
   /** Records a decision and returns the findings and protected files as they are after it. */
   decide: (finding: LocalFinding, state: DecisionState | 'open', reason: string) => Promise<Decided>;
-  /** Fixes findings on a branch, one commit each. */
+  /** Fixes findings in the working tree, without committing. */
   fix: (findings: readonly LocalFinding[], options: FixOptions) => Promise<Fixed>;
   input: NodeJS.ReadableStream & { isTTY?: boolean; setRawMode?: (raw: boolean) => unknown };
   output: NodeJS.WritableStream & { columns?: number; rows?: number };
@@ -349,6 +349,8 @@ function Browser({
             return { ...state, fixing: { ...fixing, phase: event.scanners.length > 0 ? `running ${event.scanners.join(', ')} again` : 'checking' } };
           case 'retry':
             return { ...state, fixing: { ...fixing, phase: 'not fixed yet, trying again' } };
+          case 'discarded':
+            return { ...state, message: `Dropped uncommitted edits on ${event.branch}${event.findingId ? ` for ${event.findingId}` : ''}.` };
           default:
             return state;
         }
@@ -519,15 +521,16 @@ function Browser({
 }
 
 function fixMessage(run: FixRun, total: number): string {
-  const committed = run.results.filter((result) => result.commit !== null).length;
-  const stopped = run.stoppedAtCap ? ' Stopped at the cap; press F again to continue the branch.' : run.interrupted ? ' Stopped with Ctrl+C.' : '';
+  const stopped = run.stoppedAtCap ? ' Stopped at the cap; press F again to continue.' : run.interrupted ? ' Stopped with Ctrl+C.' : '';
   if (total === 1 && run.results.length === 1) {
     const result = run.results[0]!;
     if (result.commit) return `${result.finding.id} is fixed on branch ${run.branch}. Open it to see the change.${stopped}`;
+    if (result.status === 'fixed' || result.status === 'committed_unverified') return `${result.finding.id} is fixed in the working tree. Nothing was committed.${stopped}`;
     return `${result.finding.id} is not fixed: ${result.error ?? result.status.replace(/_/g, ' ')}.${stopped}`;
   }
-  const already = run.alreadyOnBranch > 0 ? ` ${run.alreadyOnBranch} were already on it.` : '';
-  return `${committed} of ${run.results.length} fixed${run.branch ? ` on branch ${run.branch}` : ''}.${already}${stopped}`;
+  const applied = run.results.filter((result) => result.status === 'fixed' || result.status === 'committed_unverified').length;
+  const already = run.alreadyOnBranch > 0 ? ` ${run.alreadyOnBranch} were already fixed in the working tree.` : '';
+  return `${applied} of ${run.results.length} fixed in the working tree.${already}${stopped}`;
 }
 
 function decidedMessage(finding: LocalFinding, decision: DecisionState | 'open', decided: Decided): string {

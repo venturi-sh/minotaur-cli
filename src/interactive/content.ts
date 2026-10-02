@@ -208,9 +208,9 @@ export function fixLabel(state: BrowserState, finding: LocalFinding): CheckLabel
   const branch = fix.branch ?? 'branch';
   switch (fix.status) {
     case 'fixed':
-      return { text: `⎇ ${branch}`, color: 'green', bold: true };
+      return fix.commit ? { text: `⎇ ${branch}`, color: 'green', bold: true } : { text: 'edited', color: 'green', bold: true };
     case 'committed_unverified':
-      return { text: `⎇ ${branch} ?`, color: 'yellow' };
+      return fix.commit ? { text: `⎇ ${branch} ?`, color: 'yellow' } : { text: 'edited, not verified', color: 'yellow' };
     case 'unverified':
       return { text: '? not verified', color: 'yellow' };
     case 'skipped':
@@ -259,7 +259,7 @@ export function questionPrompt(question: Question): Segment[] {
   ];
   if (question.kind === 'batch') {
     const count = question.findings.length;
-    return ask(`Fix ${count === 1 ? 'the 1 finding' : `all ${count} findings`} shown, one commit each on one branch?`);
+    return ask(`Fix ${count === 1 ? 'the 1 finding' : `all ${count} findings`} shown in the working tree? Nothing is committed.`);
   }
   return [
     { text: `Spent $${question.spentUsd.toFixed(2)} of $${question.capUsd.toFixed(2)}: ${question.fixed} fixed, ${question.notFixed} not, ${question.remaining} to go.  `, dim: true },

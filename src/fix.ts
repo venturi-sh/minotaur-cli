@@ -1,10 +1,10 @@
 /**
- * Fixing findings on a branch of their own.
+ * Fixing findings in the working tree.
  *
- * Each finding is fixed in a worktree at the scanned commit, and the fix only
- * counts once the scanner that reported the finding runs again and no longer
- * reports it. A fix that passes becomes one commit; one that does not is
- * undone, so the next finding starts from the last good commit.
+ * Each finding is edited on the current branch, and the fix only stays once
+ * the scanner that reported it runs again and no longer reports it. Nothing
+ * is committed. A fix that does not pass is undone, so the next finding
+ * starts from the last edit that did.
  *
  * Code and configuration are fixed by a model. A dependency with a known
  * fixed version is upgraded by its package manager, and only falls back to a
@@ -52,11 +52,10 @@ import {
   changedPaths,
   closeFixBranch,
   commitFix,
-  commitsOnBranch,
-  discardChanges,
-  fixedOnBranch,
-  openFixBranch,
+  restoreTree,
+  snapshotTree,
   uncommittedDiff,
+  workingCopy,
   type FixBranch,
 } from './worktree.js';
 
@@ -290,6 +289,7 @@ export type FixEvent =
   | { type: 'verify'; finding: LocalFinding; scanners: string[] }
   | { type: 'retry'; finding: LocalFinding; problems: string[] }
   | { type: 'already_fixed'; count: number }
+  | { type: 'discarded'; branch: string; findingId: string | null }
   | { type: 'done'; result: FixResult };
 
 /** What a person is shown at the batch's checkpoint. */
@@ -363,7 +363,7 @@ interface RunState {
 }
 
 export async function runFixes(options: RunFixesOptions): Promise<FixRun> {
-  const branch = await openFixBranch(options.target, options.branch, options.cache, { force: options.force ?? false });
+  const branch = await workingCopy(options.target);
   const rescan: Rescan =
     options.rescan ??
     ((tree, sources) => collectFindings(tree, sources, { includeIgnored: options.includeIgnored, managed: options.managed ?? {} }));
@@ -376,20 +376,18 @@ export async function runFixes(options: RunFixesOptions): Promise<FixRun> {
     remaining: 0,
     stoppedAtCap: false,
   };
-  let kept = false;
   let todo = [...options.findings];
   let alreadyOnBranch = 0;
   try {
-    // The branch is shared by every run: what it already fixed is skipped.
-    const done = await fixedOnBranch(branch);
-    todo = todo.filter((finding) => !done.has(finding.fingerprint));
-    alreadyOnBranch = options.findings.length - todo.length;
-    if (alreadyOnBranch > 0) options.onEvent?.({ type: 'already_fixed', count: alreadyOnBranch });
-    // Earlier commits may have fixed more than they name, and the branch's code differs from the scan's, so it is scanned once as it is now.
-    if (todo.length > 0 && (await commitsOnBranch(branch)) > 0) {
+    // Edits from an earlier run are already in the tree. A finding they removed needs nothing more.
+    if (todo.length > 0 && (await snapshotTree(branch)).size > 0) {
       const scanners = options.sources.filter((source) => 'scanner' in source);
       const now = await rescan(branch.tree, scanners);
-      state.baseline.accept(now.findings, scanners.map((source) => ('scanner' in source ? source.scanner : '')), 'an earlier commit on the branch');
+      state.baseline.accept(now.findings, scanners.map((source) => ('scanner' in source ? source.scanner : '')), 'an earlier edit');
+      const pending = todo.filter((finding) => !state.baseline.resolvedBy(finding));
+      alreadyOnBranch = todo.length - pending.length;
+      todo = pending;
+      if (alreadyOnBranch > 0) options.onEvent?.({ type: 'already_fixed', count: alreadyOnBranch });
     }
     for (const [index, finding] of todo.entries()) {
       if (options.abortSignal?.aborted || state.stoppedAtCap) {
@@ -403,11 +401,10 @@ export async function runFixes(options: RunFixesOptions): Promise<FixRun> {
       options.onEvent?.({ type: 'done', result });
     }
   } finally {
-    ({ kept } = await closeFixBranch(branch));
+    for (const result of state.results) result.branch = null;
   }
-  if (!kept) for (const result of state.results) result.branch = null;
   return {
-    branch: kept ? branch.name : null,
+    branch: null,
     results: state.results,
     interrupted: options.abortSignal?.aborted ?? false,
     stoppedAtCap: state.stoppedAtCap,
@@ -443,8 +440,9 @@ async function fixOne(finding: LocalFinding, state: RunState, options: RunFixesO
   }
 
   const progress: Progress = { verification: null, summary: null, notes: [], changedFiles: [], model: options.model?.spec.id ?? 'none' };
+  const before = await snapshotTree(branch);
   const finish = async (status: FixStatus, extra: Partial<FixResult> = {}): Promise<FixResult> => {
-    if (extra.commit == null) await discardChanges(branch);
+    if (status !== 'fixed' && status !== 'committed_unverified') await restoreTree(branch, before);
     const attempt = progress.attempt;
     return {
       ...resultBase(finding, progress.model, branch.name),
@@ -475,7 +473,7 @@ async function fixOne(finding: LocalFinding, state: RunState, options: RunFixesO
         guidance = `${upgraded.guidance}\n\nMinotaur tried the package manager first, and it refused: ${upgraded.error}`;
         dependencyDir = plan.dir;
         progress.notes = [];
-        await discardChanges(branch);
+        await restoreTree(branch, before);
       } else {
         guidance = plan.guidance;
         dependencyDir = plan.dir;
@@ -600,16 +598,17 @@ async function checkpoint(finding: LocalFinding, state: RunState, options: RunFi
   return go;
 }
 
-/** What checking and committing a change needs, whoever made it. */
+/** What checking a change needs. `commit` is only for an agent's `fix --verify`. */
 interface VerifyContext {
   branch: FixBranch;
   baseline: Baseline;
   rescan: Rescan;
+  commit: boolean;
   options: Pick<RunFixesOptions, 'sources' | 'allowUnverified' | 'onEvent'>;
 }
 
 function contextOf(state: RunState, options: RunFixesOptions): VerifyContext {
-  return { branch: state.branch, baseline: state.baseline, rescan: state.rescan, options };
+  return { branch: state.branch, baseline: state.baseline, rescan: state.rescan, commit: false, options };
 }
 
 /**
@@ -636,7 +635,7 @@ export async function verifyAgentFix(options: {
   const rescan: Rescan =
     options.rescan ??
     ((tree, sources) => collectFindings(tree, sources, { includeIgnored: options.includeIgnored, managed: options.managed ?? {} }));
-  const context: VerifyContext = { branch: options.branch, baseline: new Baseline(options.scanned), rescan, options };
+  const context: VerifyContext = { branch: options.branch, baseline: new Baseline(options.scanned), rescan, commit: true, options };
   const progress = { changedFiles: [] as string[], verification: null as Verification | null, model: options.by };
   const verdict = await verifyAndCommit(options.finding, context, progress, { outcome: 'fixed', summary: options.summary, notes: [] });
   if (verdict.extra.commit) await closeFixBranch(options.branch);
@@ -677,14 +676,19 @@ async function verifyAndCommit(
 
   if (sources.length === 0 && verification.problems.length === 0) {
     if (!options.allowUnverified) {
-      return { status: 'unverified', extra: { error: 'no scanner that reported this finding can run again; --allow-unverified commits it anyway' } };
+      return { status: 'unverified', extra: { error: 'no scanner that reported this finding can run again; --allow-unverified leaves the edit anyway' } };
     }
+    if (!context.commit) return { status: 'committed_unverified', extra: { commit: null } };
     const commit = await commitFix(branch, changed, commitMessage(finding, submission, progress.model, false));
     return { status: 'committed_unverified', extra: { commit } };
   }
   if (!verification.passed) return { status: 'failed', extra: { error: verification.problems.join('; ') } };
-  // Every finding the change removes is named, so a later run can show them all as fixed on this branch.
   const removed = baseline.removedIn(checked.after, verification.scanners);
+  if (!context.commit) {
+    baseline.accept(checked.after, verification.scanners, 'this edit');
+    return { status: 'fixed', extra: { commit: null } };
+  }
+  // Every finding the change removes is named, so a later run can show them all as fixed on this branch.
   const commit = await commitFix(branch, changed, commitMessage(finding, submission, progress.model, true, removed));
   baseline.accept(checked.after, verification.scanners, commit);
   return { status: 'fixed', extra: { commit } };

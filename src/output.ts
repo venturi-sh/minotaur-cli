@@ -185,14 +185,14 @@ const FIX_LABEL: Record<FixStatus, string> = {
   skipped: 'Skipped',
 };
 
-/** The result of `minotaur fix`: what happened to each finding, and where the commits are. */
+/** The result of `minotaur fix`: what happened to each finding. Edits stay in the working tree. */
 export function renderFixRun(run: FixRun, base: string, style: Style, resume: string | null = null): string {
-  const committed = run.results.filter((result) => result.commit !== null);
+  const applied = run.results.filter((result) => result.status === 'fixed' || result.status === 'committed_unverified');
   const lines: string[] = [];
   for (const result of run.results) {
     const finding = result.finding;
-    const label = FIX_LABEL[result.status];
-    const colored = result.status === 'fixed' ? style.green(label) : result.commit ? style.yellow(label) : style.red(label);
+    const label = result.status === 'committed_unverified' && !result.commit ? 'Applied, not verified' : FIX_LABEL[result.status];
+    const colored = result.status === 'fixed' ? style.green(label) : applied.includes(result) ? style.yellow(label) : style.red(label);
     lines.push(
       `${style.bold(finding.id)}  ${style.severity(finding.severity as Severity, finding.severity)}  ${finding.title}${finding.location ? `  ${style.dim(locationOf(finding))}` : ''}`,
       `  ${colored}${result.commit ? ` in ${result.commit.slice(0, 7)}` : ''}${result.attempts > 1 ? style.dim(` after ${result.attempts} attempts`) : ''}`,
@@ -206,17 +206,21 @@ export function renderFixRun(run: FixRun, base: string, style: Style, resume: st
 
   const total = run.results.length;
   const cost = run.results.reduce((sum, result) => sum + result.costUsd, 0);
-  const done = `${committed.length} of ${total} finding${total === 1 ? '' : 's'} committed${cost > 0 ? `, $${cost.toFixed(2)}` : ''}`;
-  if (run.branch) {
+  const committed = applied.filter((result) => result.commit !== null);
+  if (run.branch && committed.length > 0) {
+    const done = `${committed.length} of ${total} finding${total === 1 ? '' : 's'} committed${cost > 0 ? `, $${cost.toFixed(2)}` : ''}`;
     lines.push(
       `${style.bold(done)} on branch ${style.bold(run.branch)}.`,
       style.dim(`Review: git log -p ${base.slice(0, 7)}..${run.branch}`),
       style.dim(`Merge:  git merge ${run.branch}`),
     );
+  } else if (applied.length > 0) {
+    const done = `${applied.length} of ${total} finding${total === 1 ? '' : 's'} applied${cost > 0 ? `, $${cost.toFixed(2)}` : ''}`;
+    lines.push(`${style.bold(done)} in the working tree. Nothing was committed.`);
   } else {
-    lines.push(`${style.bold(done)}. No branch was kept.`);
+    lines.push(`${style.bold(`0 of ${total} applied`)}. The working tree is unchanged.`);
   }
-  if (run.alreadyOnBranch > 0) lines.push(style.dim(`${run.alreadyOnBranch} more ${run.alreadyOnBranch === 1 ? 'was' : 'were'} already fixed on the branch.`));
+  if (run.alreadyOnBranch > 0) lines.push(style.dim(`${run.alreadyOnBranch} more ${run.alreadyOnBranch === 1 ? 'was' : 'were'} already fixed in the working tree.`));
   if (run.stoppedAtCap) lines.push(style.yellow('Stopped at the spend cap for the run.'));
   if (run.interrupted) lines.push(style.yellow('Stopped with Ctrl-C before every finding was tried.'));
   if (resume) lines.push(`To continue, with the same options: ${resume}`);
