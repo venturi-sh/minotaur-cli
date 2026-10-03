@@ -7,18 +7,20 @@
 
 </div>
 
-# minotaur
+# minotaur-cli
 
-Run your security scanners, hide the noise, and ask a model whether a finding is exploitable.
-Everything runs on your machine.
+Minotaur is a CLI tool designed to be easily used by either a human or an agent to surface exploitable security issues.
 
 ## Install
 
-Needs Node 22 and git.
-
 ```bash
-npm install -g minotaur-cli     # installs the minotaur command
+npm install -g minotaur-cli     # installs the `minotaur` command
 ```
+
+## Requirements
+
+- node
+- git
 
 Minotaur only scans a git repository with at least one commit. If the folder is not one, it
 offers to make a repository and commit a snapshot. You can also do that yourself:
@@ -49,8 +51,8 @@ needed: the agent reads the code and submits the answer itself.
 
 **Scanning.** By default it runs Trivy and Opengrep, and downloads them the first time. It
 also runs any other supported scanner you have installed, or reads reports you pass with
-`--source`. It scans `HEAD`, or the commit you give with `--commit`, and caches the scan for
-24 hours.
+`--source`. It scans `HEAD`, or the commit you give with `--commit`, never the working
+tree, and caches the scan for 24 hours.
 
 **Focus.** Findings are rated likely, maybe or noise. Style rules, test code and similar noise
 are hidden. Dependencies are ranked with CISA's exploited list and EPSS scores.

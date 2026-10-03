@@ -30,6 +30,7 @@ describe('resolveTarget', () => {
     expect(ask).toHaveBeenCalledWith('This folder is not a git repository. Make one here and commit a snapshot? [y/N] ');
     expect(target.commit.subject).toBe('snapshot');
     expect(target.head).toBe(true);
+    expect(target.copy).toBe(true);
     expect(target.uncommitted).toBe(false);
     expect(execFileSync('git', ['show', 'HEAD:note.txt'], { cwd: dir, encoding: 'utf8' })).toBe('hello\n');
   });
@@ -54,5 +55,22 @@ describe('resolveTarget', () => {
     expect(ask).toHaveBeenCalledWith('This repository has no commits yet. Commit a snapshot? [y/N] ');
     expect(target.commit.subject).toBe('snapshot');
     expect(target.head).toBe(true);
+  });
+
+  it('always uses a clean copy of the commit, even with a dirty working tree', async () => {
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    await writeFile(join(dir, 'note.txt'), 'hello\n');
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '-A'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'first'], { cwd: dir });
+    const clean = await resolveTarget(dir, undefined);
+    expect(clean.copy).toBe(true);
+    expect(clean.uncommitted).toBe(false);
+
+    await writeFile(join(dir, 'note.txt'), 'dirty\n');
+    await writeFile(join(dir, 'extra.txt'), 'x\n');
+    const dirty = await resolveTarget(dir, undefined);
+    expect(dirty.copy).toBe(true);
+    expect(dirty.uncommitted).toBe(true);
+    expect(dirty.commit.sha).toBe(clean.commit.sha);
   });
 });

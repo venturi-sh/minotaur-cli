@@ -1,10 +1,10 @@
 /**
  * Which commit a run looks at, and the directory that holds it.
  *
- * On HEAD with nothing uncommitted, the working tree is that commit, and it
- * keeps the installed dependencies the agent may want to read. Anything else
- * gets a clean copy of the commit from `git archive`, kept in the cache, so
- * the scan and the checks describe exactly what was committed.
+ * Every run scans a clean copy of that commit from `git archive`, kept in the
+ * cache. The working tree is ignored, so uncommitted edits do not change the
+ * scan or bust the cache; only a new commit does. Installed dependencies are
+ * not in a commit, so checks cannot read them.
  */
 
 import { spawn } from 'node:child_process';
@@ -31,8 +31,8 @@ export interface Target {
   head: boolean;
   /** True when the working tree has changes, including untracked files, that the commit does not have. */
   uncommitted: boolean;
-  /** True when the working tree is not the commit, so a clean copy is scanned instead. */
-  copy: boolean;
+  /** Always true: the scan tree is a clean copy of the commit, never the working tree. */
+  copy: true;
   /** The repository's top directory, and where `repo` sits in it. */
   top: string;
   prefix: string;
@@ -72,12 +72,11 @@ export async function resolveTarget(repo: string, ref: string | undefined, optio
   const status = await git(top, statusArgs(prefix));
   const uncommitted = status === null || status.length > 0;
   const isHead = sha === head;
-  return { repo, commit: { sha, short, subject }, head: isHead, uncommitted, copy: !isHead || uncommitted, top, prefix };
+  return { repo, commit: { sha, short, subject }, head: isHead, uncommitted, copy: true, top, prefix };
 }
 
-/** The directory to scan and read: the working tree, or a clean copy of the commit made on first use. */
+/** The clean copy of the commit to scan and read, made on first use and reused after that. */
 export async function treeFor(target: Target, cache: string): Promise<string> {
-  if (!target.copy) return target.repo;
   const copies = join(cache, 'trees', createHash('sha256').update(target.top).digest('hex').slice(0, 16));
   const dir = join(copies, target.commit.sha);
   if (await isDirectory(dir)) {
@@ -103,16 +102,15 @@ export async function treeFor(target: Target, cache: string): Promise<string> {
   return tree;
 }
 
-/** True while the working tree still matches the commit, so a check that read it describes the commit. */
-export async function stillCommitted(target: Target): Promise<boolean> {
-  if (target.copy) return true;
-  return (await git(target.top, statusArgs(target.prefix))) === '';
+/** True when a finished check still describes the commit it read. Always, because the tree is that commit. */
+export async function stillCommitted(_target: Target): Promise<boolean> {
+  return true;
 }
 
 /**
- * Changes that make the working tree differ from the commit. Marking a finding
- * writes the decisions file, and that alone should not switch every later run
- * to a clean copy; decisions are read from the working tree either way.
+ * Changes that make the working tree differ from the commit. Used only to say
+ * so in the notes. Marking a finding writes the decisions file, and that alone
+ * should not count; decisions are read from the working tree either way.
  */
 function statusArgs(prefix: string): string[] {
   return ['status', '--porcelain', '-z', '--untracked-files=all', '--', ':/', `:(top,exclude)${prefix}${DECISIONS_FILE}`];
@@ -123,13 +121,12 @@ export function describeCommit(commit: Commit): string {
   return `commit ${commit.short}${commit.subject ? ` (${commit.subject})` : ''}`;
 }
 
-/** What a person should know about where the findings come from, or nothing when it is the working tree as it is. */
+/** What a person should know about where the findings come from. */
 export function targetNotes(target: Target): string[] {
-  if (!target.copy) return [];
-  const why = target.head
+  const where = target.uncommitted
     ? `Uncommitted changes are left out: this is ${target.commit.short} as committed.`
     : `This is ${target.commit.short} as committed, not your working tree.`;
-  return [`${why} Installed dependencies are not in a commit, so checks cannot read them.`];
+  return [`${where} Installed dependencies are not in a commit, so checks cannot read them.`];
 }
 
 function archive(top: string, sha: string, into: string): Promise<void> {

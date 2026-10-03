@@ -110,9 +110,9 @@ it offers to make a repository and commit a snapshot.
 
 Sources (all commands):
   --commit REF           The commit to look at: a hash, branch or tag (default HEAD).
-                         On HEAD with no uncommitted changes this is your working tree;
-                         otherwise a clean copy of the commit, so uncommitted changes
-                         and installed dependencies are left out.
+                         Always a clean copy of that commit, so uncommitted changes
+                         and installed dependencies are left out. The scan is reused
+                         until the commit changes.
   --source NAME|FILE     A scanner (${NATIVE_SCANNERS.join(', ')}) or a report file
                          (SARIF, or a supported scanner's JSON). Repeatable. Overrides
                          .minotaur.yml. Default: trivy, opengrep, and any other installed
@@ -476,7 +476,7 @@ function scopeOf(target: Target): CheckScope {
   return { repo: target.repo, commit: target.commit.sha, copy: target.copy };
 }
 
-/** Keeps finished checks for this commit, unless the working tree moved away from it while the check ran. */
+/** Keeps finished checks for this commit. The tree is always that commit, so they stay valid. */
 function keeper(target: Target, model: ResolvedModel): RunTriageOptions['keep'] {
   const dir = checkCacheDir(cacheDir());
   return async (result, inputs) => {

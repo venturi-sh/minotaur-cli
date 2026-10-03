@@ -1,14 +1,12 @@
 /**
  * The last scan of each repository, reused while nothing it depends on has
- * changed: the commit, the sources and the scanners. Gitignored files are not
- * scanned, so they are not part of that, unless the run asked to include them.
- * Entries also expire, because a scanner's vulnerability database moves on
- * even when the code does not.
+ * changed: the commit, the sources and the scanners. The working tree is never
+ * part of that. Entries also expire, because a scanner's vulnerability
+ * database moves on even when the code does not.
  */
 
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
 import { localScannerByName } from './scanners/index.js';
@@ -48,8 +46,8 @@ const entrySchema = z.object({
 });
 
 /**
- * A digest of everything the scan result depends on, or null when git cannot
- * list the ignored files. `tree` is where the scan runs, as `treeFor` gives it.
+ * A digest of everything the scan result depends on. `tree` is the clean copy
+ * of the commit where the scan runs, as `treeFor` gives it.
  */
 export async function scanKey(
   target: Target,
@@ -60,14 +58,6 @@ export async function scanKey(
   const hash = createHash('sha256');
   const { repo, copy, prefix } = target;
   hash.update(JSON.stringify({ format: FORMAT, repo, commit: target.commit.sha, copy, prefix, includeIgnored, sources, tools: pinnedTools() }));
-  if (!copy && includeIgnored) {
-    const listed = await git(target.top, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z']);
-    if (listed === null) return null;
-    for (const path of listed.split('\0').filter(Boolean).sort()) {
-      const info = await lstat(join(target.top, path)).catch(() => null);
-      hash.update(`${path}\0${info?.size ?? -1}\0${info?.mtimeMs ?? -1}\0`);
-    }
-  }
   for (const source of sources) hash.update(`${await sourceStamp(tree, source)}\0`);
   return hash.digest('hex');
 }
@@ -229,14 +219,4 @@ async function sourceStamp(root: string, source: SourceConfig): Promise<string> 
 async function fileStamp(path: string): Promise<string> {
   const info = await stat(path).catch(() => null);
   return info ? `${info.size}:${info.mtimeMs}` : 'missing';
-}
-
-function git(cwd: string, args: readonly string[]): Promise<string | null> {
-  return new Promise((done) => {
-    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
-    const chunks: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
-    child.on('error', () => done(null));
-    child.on('close', (code) => done(code === 0 ? Buffer.concat(chunks).toString('utf8') : null));
-  });
 }

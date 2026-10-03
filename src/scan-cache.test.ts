@@ -64,19 +64,20 @@ describe('scan cache', () => {
     expect(await keyOf()).toBe(key);
   });
 
-  it('changes the key with the commit, the sources and the ignored-file option, not with an ignored file', async () => {
+  it('changes the key with the commit and the sources, not with ignored or uncommitted files', async () => {
     const baseline = await keyOf();
-    expect(await keyOf(REPORT, true)).not.toBe(baseline);
+    const withIgnored = await keyOf(REPORT, true);
+    expect(withIgnored).not.toBe(baseline);
     expect(await keyOf([{ scanner: 'trivy' }])).not.toBe(baseline);
 
     await writeFile(join(repo, '.env'), 'TOKEN=1\n');
     await mkdir(join(repo, 'node_modules', 'pkg'), { recursive: true });
     await writeFile(join(repo, 'node_modules', 'pkg', 'index.js'), 'x\n');
     expect(await keyOf()).toBe(baseline);
-
-    const included = await keyOf(REPORT, true);
+    // Ignored files are not in the commit copy, so --include-ignored does not see them either.
+    expect(await keyOf(REPORT, true)).toBe(withIgnored);
     await writeFile(join(repo, '.env'), 'TOKEN=2\n');
-    expect(await keyOf(REPORT, true)).not.toBe(included);
+    expect(await keyOf(REPORT, true)).toBe(withIgnored);
 
     await writeFile(join(repo, 'report.sarif'), '{"runs":[]}');
     run('add', '.');
@@ -85,8 +86,9 @@ describe('scan cache', () => {
   });
 
   it('keeps the key of a commit while uncommitted changes come and go, since they are not scanned', async () => {
-    await writeFile(join(repo, 'app.js'), 'two\n');
     const key = await keyOf();
+    await writeFile(join(repo, 'app.js'), 'two\n');
+    expect(await keyOf()).toBe(key);
     await writeFile(join(repo, 'app.js'), 'owt\n');
     await writeFile(join(repo, 'new.js'), 'x\n');
     expect(await keyOf()).toBe(key);

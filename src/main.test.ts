@@ -301,11 +301,10 @@ describe('minotaur scan', () => {
     expect(await run('--rescan')).toContain('Scanning');
     expect(stdout).toContain(`On commit ${first} (first).`);
 
-    // An uncommitted edit is left out, so the scan is of a clean copy of the commit.
+    // Uncommitted edits are left out of the tree, so the cached scan of the commit still applies.
     await writeFile(join(root, 'routes', 'login.js'), 'changed\n');
     expect(await run()).toContain('Uncommitted changes are left out');
-    expect(stderr).toContain('Scanning');
-    expect(await run()).toContain('Using the scan');
+    expect(stderr).toContain('Using the scan');
     expect(stdout).toContain('routes/login.js:2');
   });
 
@@ -414,7 +413,8 @@ describe('agent verdicts', () => {
 
     expect(await main(['brief', code.id, root, ...sources(), '--json'])).toBe(0);
     const brief = JSON.parse(stdout);
-    expect(brief.tree).toBe(root);
+    expect(brief.tree).not.toBe(root);
+    expect(brief.tree).toContain(brief.commit.sha);
     expect(brief.commit.short).toBe(first);
     expect(brief.instructions).toContain('exploitable');
     expect(brief.instructions).toContain('untrusted data');
@@ -459,16 +459,20 @@ describe('agent verdicts', () => {
     expect(JSON.parse(stdout).problems[0]).toMatch(/secret/);
   });
 
-  it('points at the clean copy when the working tree has changes', async () => {
+  it('points at the clean copy of the commit, not the working tree', async () => {
     commitAll('first');
     const { findings } = await scanJson();
     const code = findings.find((finding) => finding.kind === 'sast')!;
-    await writeFile(join(root, 'notes.txt'), 'changed\n');
     stdout = '';
     expect(await main(['brief', code.id, root, ...sources(), '--json'])).toBe(0);
     const brief = JSON.parse(stdout);
     expect(brief.tree).not.toBe(root);
     expect(brief.tree).toContain(brief.commit.sha);
+
+    await writeFile(join(root, 'notes.txt'), 'changed\n');
+    stdout = '';
+    expect(await main(['brief', code.id, root, ...sources(), '--json'])).toBe(0);
+    expect(JSON.parse(stdout).tree).toBe(brief.tree);
   });
 });
 
