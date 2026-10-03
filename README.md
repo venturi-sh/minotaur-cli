@@ -11,6 +11,20 @@
 
 Minotaur is a CLI tool designed to be easily used by either a human or an agent to surface exploitable security issues.
 
+It relies on existing security scanners like trivy or opengrep (configurable) and hands over exploitabililty checks to a LLM (also configurable).
+
+The simplest way to use it is to hand it over to an LLM directly, allowing you to rely on subscription usage.
+
+e.g.
+
+```
+Use the minotaur cli to find critical potential security vulnerabilities and determine their exploitability.
+```
+
+you can then browse the results using the TUI by simply running the `minotaur` command.
+
+Alternatively, you can plug into an LLM API by either setting an API_KEY or using oauth for Anthropic with `minotaur auth login`.
+
 ## Install
 
 ```bash
