@@ -23,7 +23,9 @@ Use the minotaur cli to find critical potential security vulnerabilities and det
 
 you can then browse the results using the TUI by simply running the `minotaur` command.
 
-Alternatively, you can plug into an LLM API by either setting an API_KEY or using oauth for Anthropic with `minotaur auth login`.
+Alternatively, Minotaur can run its checks on your Claude subscription through Claude Code
+(`--model claude-code`), or you can plug into an LLM API by either setting an API_KEY or using
+oauth for Anthropic with `minotaur auth login`.
 
 ## Install
 
@@ -94,6 +96,22 @@ minotaur auth login anthropic
 minotaur auth login openai
 ```
 
+Or use your Claude subscription. Minotaur starts Claude Code through the
+[Agent Client Protocol](https://agentclientprotocol.com), so a check uses the login of Claude
+Code, not an API key:
+
+```bash
+npm install -g @agentclientprotocol/claude-agent-acp   # the Claude Code ACP adapter
+claude                                                 # sign in with /login, once
+minotaur triage 3f9a1c2e --model claude-code           # claude-sonnet-5
+minotaur triage 3f9a1c2e --model claude-code:claude-opus-5-5 --effort high
+```
+
+Claude Code gets only Minotaur's read tools, so the same files stay out of the check. It loads
+none of your Claude Code settings, nor the settings of the repository. Minotaur removes
+`ANTHROPIC_API_KEY` from its environment, so it does not use the key. A check has a step limit,
+but no dollar limit. Set `MINOTAUR_ACP_COMMAND` to use a different adapter.
+
 Or call OpenAI by name:
 
 ```bash
@@ -108,7 +126,8 @@ minotaur triage 3f9a1c2e --model openai-compatible:qwen3-coder --base-url http:/
 
 `minotaur config` asks which scanners to run and which model to use, and writes them to
 `.minotaur.yml` at the repository root. If Trivy or Opengrep is missing, it offers to download
-them. On macOS, if Homebrew is installed, it offers to install the other scanners with it. API
+them. If you choose your Claude subscription through Claude Code and the ACP adapter is
+missing, it offers to install the adapter with npm. On macOS, if Homebrew is installed, it offers to install the other scanners with it. API
 keys go only in environment variables. A Console login is stored by the `ant` command, and an
 OpenAI key by `minotaur auth login openai`, not in the repository.
 

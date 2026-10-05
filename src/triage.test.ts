@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { LocalFinding } from './sources.js';
-import { loadEarlierCheck, refusalFor, type TriageResult } from './triage.js';
+import { resolveModel } from './model.js';
+import { loadEarlierCheck, modelLabel, refusalFor, type TriageResult } from './triage.js';
 
 function finding(overrides: Partial<LocalFinding>): LocalFinding {
   return {
@@ -22,6 +23,18 @@ function finding(overrides: Partial<LocalFinding>): LocalFinding {
     ...overrides,
   };
 }
+
+describe('modelLabel', () => {
+  it('names the model, its effort and how it is reached', async () => {
+    expect(modelLabel(await resolveModel({}, {}, { ANTHROPIC_API_KEY: 'sk-test' }))).toBe(
+      'anthropic:claude-sonnet-5 (medium) via ANTHROPIC_API_KEY',
+    );
+    expect(modelLabel(await resolveModel({ model: 'claude-code' }, {}, {}))).toBe('claude-code:claude-sonnet-5 (medium) via ACP, Claude subscription');
+    expect(modelLabel(await resolveModel({ model: 'openai-compatible:qwen', baseUrl: 'http://localhost:11434/v1' }, {}, {}))).toBe(
+      'openai-compatible:qwen via http://localhost:11434/v1',
+    );
+  });
+});
 
 describe('refusalFor', () => {
   const none = new Set<string>();

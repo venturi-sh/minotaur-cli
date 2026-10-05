@@ -59,6 +59,7 @@ import {
   DEFAULT_MAX_USD,
   describeLimits,
   describeModel,
+  modelLabel,
   earlierFrom,
   identityOf,
   loadEarlierCheck,
@@ -148,10 +149,12 @@ To find exploitable vulnerabilities without a model key, an agent does this:
 
 triage:
   --findings FILE        Read findings from "scan --json" output instead of re-running sources
-  --model PROVIDER:MODEL anthropic:claude-sonnet-5, openai:gpt-5.4, or
-                         openai-compatible:MODEL for a server you run
+  --model PROVIDER:MODEL anthropic:claude-sonnet-5, openai:gpt-5.4,
+                         openai-compatible:MODEL for a server you run, or
+                         claude-code[:MODEL] to use your Claude subscription
+                         through Claude Code (needs claude-agent-acp)
   --base-url URL         Address of an OpenAI-compatible server, e.g. http://localhost:11434/v1
-  --effort LEVEL         Anthropic effort: low, medium, high, xhigh, max (default medium)
+  --effort LEVEL         Anthropic or Claude Code effort: low, medium, high, xhigh, max (default medium)
   --max-steps N          Model calls allowed (default ${DEFAULT_MAX_STEPS})
   --max-usd N            Spend cap in US dollars (default ${DEFAULT_MAX_USD})
   --max-tokens N         Token cap, useful for a local model that costs nothing per token
@@ -211,7 +214,8 @@ auth:
 Environment:
   ANTHROPIC_API_KEY or OPENAI_API_KEY wins over a stored login. MINOTAUR_API_KEY
   is a fallback for either. MINOTAUR_MODEL, MINOTAUR_BASE_URL, MINOTAUR_CACHE_DIR
-  (where downloaded scanners, the last scans, checks and copies of commits are kept)
+  (where downloaded scanners, the last scans, checks and copies of commits are kept),
+  MINOTAUR_ACP_COMMAND (the Claude Code ACP adapter, default claude-agent-acp)
 `;
 
 export class UsageError extends Error {}
@@ -536,7 +540,7 @@ async function interactive(root: string, values: Values): Promise<number> {
   let status: ModelStatus;
   try {
     model = await resolveModel(modelFlags(values), config, process.env);
-    status = { ok: true, destination: describeModel(model), limits: describeLimits(model, limits) };
+    status = { ok: true, label: modelLabel(model), destination: describeModel(model), limits: describeLimits(model, limits) };
   } catch (error) {
     // Browsing works without a model; the view explains how to set one up when a check is asked for.
     status = { ok: false, error: (error as Error).message };

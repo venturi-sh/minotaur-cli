@@ -16,6 +16,7 @@ describe('resolveModel', () => {
     expect(resolved.spec.id).toBe('anthropic:claude-sonnet-5');
     expect(resolved.effort).toBe('medium');
     expect(resolved.destination).toBe('Anthropic API');
+    expect(resolved.access).toBe('ANTHROPIC_API_KEY');
     expect(resolved.capabilities.promptCaching).toBe(true);
   });
 
@@ -27,6 +28,9 @@ describe('resolveModel', () => {
     const flagged = await resolveModel({ model: 'openai-compatible:from-flag', baseUrl: 'http://flag:1/v1' }, config, env);
     expect(flagged.spec.id).toBe('openai-compatible:from-flag');
     expect(flagged.destination).toBe('http://flag:1/v1');
+    expect(flagged.access).toBe('http://flag:1/v1');
+    const keyed = await resolveModel({ model: 'openai-compatible:x', baseUrl: 'http://a/v1' }, {}, { MINOTAUR_API_KEY: 'k' });
+    expect(keyed.access).toBe('http://a/v1 with MINOTAUR_API_KEY');
   });
 
   it('treats a self-hosted model as free and uses none of the Anthropic features', async () => {
@@ -46,6 +50,19 @@ describe('resolveModel', () => {
     await expect(resolveModel({ effort: 'extreme' }, {}, { ANTHROPIC_API_KEY: 'k' })).rejects.toThrow(/--effort must be one of/);
   });
 
+  it('runs Claude Code on the subscription without any key', async () => {
+    const resolved = await resolveModel({ model: 'claude-code' }, {}, {});
+    expect(resolved.spec.id).toBe('claude-code:claude-sonnet-5');
+    expect(resolved.model).toBeNull();
+    expect(resolved.destination).toBe('Claude subscription, through Claude Code');
+    expect(resolved.access).toBe('ACP, Claude subscription');
+    expect(resolved.pricing).toEqual({ inputPerMTok: 0, outputPerMTok: 0 });
+    expect(resolved.effort).toBe('medium');
+    const named = await resolveModel({ model: 'claude-code:claude-opus-5-5', effort: 'high' }, {}, { ANTHROPIC_API_KEY: 'sk-test' });
+    expect(named.spec.modelId).toBe('claude-opus-5-5');
+    expect(named.effort).toBe('high');
+  });
+
   it('leaves out the config effort when --model picks a model without effort', async () => {
     const config = { model: 'anthropic:claude-opus-5-5', triage: { effort: 'high' } };
     const resolved = await resolveModel({ model: 'openai-compatible:x', baseUrl: 'http://a/v1' }, config, {});
@@ -62,9 +79,11 @@ describe('resolveModel', () => {
       expect(signedIn.destination).toBe('Anthropic API, signed in');
       expect(signedIn.spec.id).toBe('anthropic:claude-sonnet-5');
       expect(signedIn.destination).not.toContain(token);
+      expect(signedIn.access).toBe('Claude Console login');
 
       const keyed = await resolveModel({}, {}, { ...env, ANTHROPIC_API_KEY: 'sk-ant-api-from-the-env' });
       expect(keyed.destination).toBe('Anthropic API');
+      expect(keyed.access).toBe('ANTHROPIC_API_KEY');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -82,10 +101,12 @@ describe('resolveModel', () => {
       expect(signedIn.spec.id).toBe('openai:gpt-5.4');
       expect(signedIn.destination).toBe('OpenAI API, signed in');
       expect(signedIn.destination).not.toContain(key);
+      expect(signedIn.access).toBe('stored OpenAI key');
 
       const keyed = await resolveModel({}, {}, { ...env, OPENAI_API_KEY: 'sk-from-the-env' });
       expect(keyed.destination).toBe('OpenAI API');
       expect(keyed.spec.id).toBe('openai:gpt-5.4');
+      expect(keyed.access).toBe('OPENAI_API_KEY');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

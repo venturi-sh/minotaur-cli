@@ -2,10 +2,13 @@
  * Which model triages, and what it costs.
  *
  * `TRIAGE_MODEL` is `provider:model`, so switching provider is configuration
- * rather than code. Three providers exist: Anthropic, OpenAI's API, and
+ * rather than code. Four providers exist: Anthropic, OpenAI's API,
  * `openai-compatible`, which is any server that speaks the OpenAI chat
- * completions format. That covers Ollama, vLLM, LM Studio, llama.cpp and most
- * internal gateways, so the code can stay on hardware the customer controls.
+ * completions format, and `claude-code`. `openai-compatible` covers Ollama,
+ * vLLM, LM Studio, llama.cpp and most internal gateways, so the code can stay
+ * on hardware the customer controls. `claude-code` runs Claude Code through
+ * the Agent Client Protocol, so a check uses the Claude subscription that
+ * Claude Code is signed in with. See `acp.ts`.
  */
 
 import { createAnthropic } from '@ai-sdk/anthropic';
@@ -19,6 +22,8 @@ export const DEFAULT_TRIAGE_MODEL = 'anthropic:claude-sonnet-5';
 export const DEFAULT_EXPLOIT_MODEL = 'anthropic:claude-sonnet-5';
 /** Used when the only credential is an OpenAI API key. */
 export const DEFAULT_OPENAI_MODEL = 'openai:gpt-5.4';
+/** Used for `--model claude-code` with no model named. */
+export const DEFAULT_CLAUDE_CODE_MODEL = 'claude-code:claude-sonnet-5';
 const OPENAI_API = 'https://api.openai.com/v1';
 
 /** How much the model thinks and writes per call; Anthropic's `effort` setting. */
@@ -34,7 +39,7 @@ export function parseEffort(value: string | undefined, fallback: Effort, setting
   return raw as Effort;
 }
 
-export const PROVIDERS = ['anthropic', 'openai', 'openai-compatible'] as const;
+export const PROVIDERS = ['anthropic', 'openai', 'openai-compatible', 'claude-code'] as const;
 export type Provider = (typeof PROVIDERS)[number];
 
 export interface ModelSpec {
@@ -62,6 +67,8 @@ export function capabilitiesOf(spec: ModelSpec): ModelCapabilities {
     return { promptCaching: true, effort: true, forcedToolChoice: !NO_FORCED_TOOL_CHOICE.has(spec.id) };
   }
   if (spec.provider === 'openai') return { promptCaching: false, effort: false, forcedToolChoice: true };
+  // Claude Code runs its own loop and caches on its own.
+  if (spec.provider === 'claude-code') return { promptCaching: false, effort: true, forcedToolChoice: false };
   // Local servers differ in whether they honour tool_choice, and one that
   // ignores it looks exactly like a model answering in prose. Reminding works
   // everywhere.
@@ -77,7 +84,9 @@ export function parseModelSpec(
   fallback = DEFAULT_TRIAGE_MODEL,
   setting = 'TRIAGE_MODEL',
 ): ModelSpec {
-  const raw = (value ?? '').trim() || fallback;
+  const named = (value ?? '').trim();
+  // `claude-code` on its own picks its default model.
+  const raw = named === 'claude-code' ? DEFAULT_CLAUDE_CODE_MODEL : named || fallback;
   const [provider, ...rest] = raw.split(':');
   const modelId = rest.join(':');
   if (!provider || !modelId) throw new Error(`${setting} must look like provider:model, got "${raw}"`);
@@ -100,6 +109,8 @@ export function resolvePricing(
   if (env.TRIAGE_PRICE_INPUT_PER_MTOK && env.TRIAGE_PRICE_OUTPUT_PER_MTOK && input >= 0 && output >= 0) {
     return { inputPerMTok: input, outputPerMTok: output };
   }
+  // A subscription is not billed per token, so steps are what bound a check.
+  if (spec.provider === 'claude-code') return FREE;
   const known = MODEL_PRICING[spec.id];
   if (known) return known;
   if (spec.provider === 'openai-compatible') return FREE;
@@ -124,6 +135,9 @@ export interface ModelConnection {
 export function createModel(spec: ModelSpec, connection: ModelConnection | string): LanguageModel {
   const parsed = typeof connection === 'string' ? { apiKey: connection } : connection;
   const { apiKey, authToken, baseURL } = parsed;
+  if (spec.provider === 'claude-code') {
+    throw new Error(`${spec.id} runs through Claude Code, not through an API client`);
+  }
   if (spec.provider === 'anthropic') {
     // A bearer token must not also send x-api-key. The provider rejects both at once.
     const auth = authToken
@@ -155,5 +169,6 @@ export function describeDestination(spec: ModelSpec, connection: ModelConnection
     const where = connection.baseURL ? `OpenAI API via ${connection.baseURL}` : 'OpenAI API';
     return connection.signedIn ? `${where}, signed in` : where;
   }
+  if (spec.provider === 'claude-code') return 'Claude subscription, through Claude Code';
   return connection.baseURL ?? 'an unconfigured server';
 }

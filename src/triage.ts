@@ -14,6 +14,7 @@ import {
   SpendBudget,
   Workspace,
   triageFinding,
+  triageWithClaudeCode,
   type EarlierCheck,
   type StepProgress,
   type TriageSubject,
@@ -139,14 +140,21 @@ export function describeModel(model: ResolvedModel): string {
   return `${model.destination} (${model.spec.id}${model.effort ? `, ${model.effort} effort` : ''})`;
 }
 
+/** The model and how it is reached, for the header of the browser: "anthropic:claude-sonnet-5 (medium) via ANTHROPIC_API_KEY". */
+export function modelLabel(model: ResolvedModel): string {
+  return `${model.spec.id}${model.effort ? ` (${model.effort})` : ''} via ${model.access}`;
+}
+
 export function describeLimits(model: ResolvedModel, limits: TriageLimits): string {
   const free = model.pricing.inputPerMTok === 0 && model.pricing.outputPerMTok === 0;
+  const subscription = model.spec.provider === 'claude-code';
   const caps = [
     `${limits.maxSteps} steps`,
     ...(free ? [] : [`$${limits.maxUsd}`]),
-    ...(limits.maxTokens ? [`${limits.maxTokens.toLocaleString('en-US')} tokens`] : []),
+    ...(limits.maxTokens && !subscription ? [`${limits.maxTokens.toLocaleString('en-US')} tokens`] : []),
   ];
-  return `${caps.join(', ')}${free ? ' (no per-token price for this model)' : ''}`;
+  const note = subscription ? ' (uses your Claude subscription, not per-token billing)' : free ? ' (no per-token price for this model)' : '';
+  return `${caps.join(', ')}${note}`;
 }
 
 export interface RunTriageOptions {
@@ -174,21 +182,33 @@ export async function runTriage(options: RunTriageOptions): Promise<TriageResult
 
   const workspace = await Workspace.open(options.root, { denied: [...options.protectedPaths] });
   const started = Date.now();
-  const result = await triageFinding(toSubject(finding), workspace, {
-    model: model.model,
-    pricing: model.pricing,
-    budget: new SpendBudget(limits.maxUsd, limits.maxTokens),
-    maxSteps: limits.maxSteps,
-    // A full answer with an ordered attack path runs longer than a triage verdict.
-    allowance: { ...DEFAULT_ALLOWANCE, maxOutputTokens: 4_000 },
-    mode: 'exploit',
-    forcedToolChoice: model.capabilities.forcedToolChoice,
-    promptCaching: model.capabilities.promptCaching,
-    ...(model.effort ? { effort: model.effort } : {}),
-    ...(options.earlier ? { earlier: options.earlier.check } : {}),
-    ...(options.onStep ? { onStep: options.onStep } : {}),
-    ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
-  });
+  const subject = toSubject(finding);
+  const result = model.model
+    ? await triageFinding(subject, workspace, {
+        model: model.model,
+        pricing: model.pricing,
+        budget: new SpendBudget(limits.maxUsd, limits.maxTokens),
+        maxSteps: limits.maxSteps,
+        // A full answer with an ordered attack path runs longer than a triage verdict.
+        allowance: { ...DEFAULT_ALLOWANCE, maxOutputTokens: 4_000 },
+        mode: 'exploit',
+        forcedToolChoice: model.capabilities.forcedToolChoice,
+        promptCaching: model.capabilities.promptCaching,
+        ...(model.effort ? { effort: model.effort } : {}),
+        ...(options.earlier ? { earlier: options.earlier.check } : {}),
+        ...(options.onStep ? { onStep: options.onStep } : {}),
+        ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+      })
+    : // No API client: Claude Code runs the check on the Claude subscription.
+      await triageWithClaudeCode(subject, workspace, {
+        modelId: model.spec.modelId,
+        maxSteps: limits.maxSteps,
+        mode: 'exploit',
+        effort: model.effort,
+        earlier: options.earlier?.check,
+        onStep: options.onStep,
+        abortSignal: options.abortSignal,
+      });
   const exploit = result.exploit;
 
   const check: TriageResult = {

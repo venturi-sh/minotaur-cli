@@ -139,23 +139,33 @@ export async function triageFinding(
     return { ...base, status, ...(outcome.error ? { error: outcome.error } : {}) };
   }
 
+  return { ...base, ...(await settleVerdict(mode, outcome.submitted, workspace)) };
+}
+
+/** Validates a submitted answer and drops the citations the code does not match. */
+export async function settleVerdict(
+  mode: AssessmentMode,
+  submitted: unknown,
+  workspace: Workspace,
+): Promise<Pick<AgentResult, 'status' | 'verdict' | 'exploit' | 'rejected' | 'downgraded' | 'error'>> {
+  const none = { rejected: [], downgraded: false };
   try {
     if (mode === 'exploit') {
-      const parsed = exploitVerdictSchema.safeParse(outcome.submitted);
+      const parsed = exploitVerdictSchema.safeParse(submitted);
       if (!parsed.success) {
-        return { ...base, status: 'failed', error: `invalid verdict: ${parsed.error.message}` };
+        return { ...none, status: 'failed', error: `invalid verdict: ${parsed.error.message}` };
       }
       const checked = await checkExploitEvidence(parsed.data, workspace);
-      return { ...base, status: 'succeeded', exploit: checked.verdict, rejected: checked.rejected, downgraded: checked.downgraded };
+      return { status: 'succeeded', exploit: checked.verdict, rejected: checked.rejected, downgraded: checked.downgraded };
     }
 
-    const parsed = triageVerdictSchema.safeParse(outcome.submitted);
+    const parsed = triageVerdictSchema.safeParse(submitted);
     if (!parsed.success) {
-      return { ...base, status: 'failed', error: `invalid verdict: ${parsed.error.message}` };
+      return { ...none, status: 'failed', error: `invalid verdict: ${parsed.error.message}` };
     }
     const checked = await checkEvidence(parsed.data, workspace);
-    return { ...base, status: 'succeeded', verdict: checked.verdict, rejected: checked.rejected, downgraded: checked.downgraded };
+    return { status: 'succeeded', verdict: checked.verdict, rejected: checked.rejected, downgraded: checked.downgraded };
   } catch (error) {
-    return { ...base, status: 'failed', error: (error as Error).message };
+    return { ...none, status: 'failed', error: (error as Error).message };
   }
 }

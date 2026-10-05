@@ -41,9 +41,11 @@
     "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
   },
   "devDependencies": {
+    "@agentclientprotocol/sdk": "~1.5.1",
     "@ai-sdk/anthropic": "^4.0.58",
     "@ai-sdk/openai-compatible": "^3.0.53",
     "@inkjs/ui": "^2.0.0",
+    "@modelcontextprotocol/sdk": "~1.30.1",
     "@types/node": "^22.10.5",
     "@types/react": "^19.2.18",
     "@vitest/coverage-v8": "^4.1.10",

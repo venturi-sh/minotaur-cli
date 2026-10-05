@@ -152,7 +152,111 @@ describe('configureRepository', () => {
   });
 });
 
+describe('configureRepository with Claude Code', () => {
+  it('installs the ACP adapter when asked, after the file is written', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'minotaur-config-'));
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const acpInstall = vi.fn(async () => 0);
+    try {
+      expect(
+        await configureRepository({
+          root,
+          env: {},
+          anthropicReady: false,
+          acpReady: false,
+          installAcp: true,
+          acpInstall,
+          answers: { scanners: ['trivy'], provider: 'claude-code', modelId: 'claude-opus-5-5' },
+        }),
+      ).toBe(0);
+      expect((await loadConfig(root)).config.model).toBe('claude-code:claude-opus-5-5');
+      expect(acpInstall).toHaveBeenCalledOnce();
+      const said = stderr.mock.calls.map((call) => String(call[0])).join('');
+      expect(said).toContain('Installed the Claude Code ACP adapter.');
+      expect(said).toContain('/login');
+      expect(said).not.toContain('ANTHROPIC_API_KEY');
+    } finally {
+      vi.restoreAllMocks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('says how to install the adapter when it is missing and was not installed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'minotaur-config-'));
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const acpInstall = vi.fn(async () => 0);
+    try {
+      expect(
+        await configureRepository({ root, env: {}, anthropicReady: true, acpReady: false, acpInstall, answers: { scanners: ['trivy'], provider: 'claude-code' } }),
+      ).toBe(0);
+      expect(acpInstall).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.map((call) => String(call[0])).join('')).toContain('npm install -g @agentclientprotocol/claude-agent-acp');
+    } finally {
+      vi.restoreAllMocks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails when npm does not install the adapter, and keeps the file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'minotaur-config-'));
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(
+        await configureRepository({
+          root,
+          env: {},
+          anthropicReady: true,
+          acpReady: false,
+          installAcp: true,
+          acpInstall: async () => 1,
+          answers: { scanners: ['trivy'], provider: 'claude-code' },
+        }),
+      ).toBe(1);
+      expect((await loadConfig(root)).config.model).toBe('claude-code:claude-sonnet-5');
+    } finally {
+      vi.restoreAllMocks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('askConfig', () => {
+  it('chooses Claude Code and offers to install its adapter', async () => {
+    const { input, output, screen } = terminal();
+    const pending = askConfig({
+      config: {},
+      installed: new Set(['trivy']),
+      fallbackScanners: ['trivy'],
+      anthropicReady: false,
+      acpReady: false,
+      input,
+      output,
+    });
+    await tick();
+    input.write('\r');
+    await tick();
+    expect(screen()).toContain('Your Claude subscription, through Claude Code (ACP)');
+    input.write('\u001b[B');
+    await tick();
+    input.write('\r');
+    await tick();
+    expect(screen()).toContain('Which Claude model should Claude Code use?');
+    input.write('\r');
+    await tick();
+    expect(screen()).toContain('model: claude-code:claude-sonnet-5');
+    input.write('\r');
+    await tick();
+    expect(screen()).toContain('claude-agent-acp) is not installed');
+    input.write('\r');
+    const outcome = await pending;
+    expect(outcome?.choices).toMatchObject({ provider: 'claude-code', modelId: 'claude-sonnet-5' });
+    expect(outcome?.installAcp).toBe(true);
+    expect(outcome?.signIn).toBe(false);
+  });
+
   it('walks the questions and returns the highlighted choices', async () => {
     const { input, output, screen } = terminal();
     const pending = askConfig({

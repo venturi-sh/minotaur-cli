@@ -447,6 +447,14 @@ function Header({ state, columns }: { state: BrowserState; columns: number }) {
           </Text>
           <Text dimColor>{`  ${root}`}</Text>
           {state.commit && <Text color="yellow">{`  @ ${state.commit.split(' ')[0]}`}</Text>}
+          {state.model.ok ? (
+            <Text>
+              <Text dimColor>{'  model '}</Text>
+              <Text>{state.model.label}</Text>
+            </Text>
+          ) : (
+            <Text color="yellow">{'  no model set up'}</Text>
+          )}
         </Text>
       </Box>
       <Spacer />

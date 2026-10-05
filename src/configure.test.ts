@@ -70,6 +70,14 @@ describe('applyChoices', () => {
     const bad: ConfigChoices = { scanners: ['trivy'], provider: 'openai-compatible', modelId: 'qwen', baseUrl: 'localhost:11434' };
     expect(() => applyChoices({}, bad)).toThrow(/http or https/);
     expect(() => applyChoices({}, { scanners: ['trivy'], provider: 'anthropic', modelId: 'not-a-model' })).toThrow(/unknown Anthropic model/);
+    expect(() => applyChoices({}, { scanners: ['trivy'], provider: 'claude-code', modelId: 'not-a-model' })).toThrow(/unknown Claude model/);
+  });
+
+  it('records a Claude Code model and drops the server address', () => {
+    const next = applyChoices({ model: 'openai-compatible:qwen', baseUrl: 'http://localhost:11434/v1' }, { scanners: ['trivy'], provider: 'claude-code' });
+    expect(next.model).toBe('claude-code:claude-sonnet-5');
+    expect(next.baseUrl).toBeUndefined();
+    expect(applyChoices({}, { scanners: ['trivy'], provider: 'claude-code', modelId: 'claude-opus-5-5' }).model).toBe('claude-code:claude-opus-5-5');
   });
 });
 

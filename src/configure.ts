@@ -13,11 +13,13 @@ import { join } from 'node:path';
 import { stringify } from 'yaml';
 import { z } from 'zod';
 
+import { ACP_PACKAGE, DEFAULT_ACP_COMMAND } from './agent/acp.js';
 import { MODEL_PRICING } from './agent/budget.js';
 import { DEFAULT_EXPLOIT_MODEL, parseModelSpec, type Provider } from './agent/model.js';
 import { loadConsoleToken, type Env } from './auth.js';
 import { CONFIG_FILE, configSchema, parseConfig, type Config, type SourceConfig } from './config.js';
 import { ensureRules, ensureTool, isManaged, type EnsureOptions } from './managed.js';
+import { isInstalled } from './scanners/index.js';
 import { NATIVE_SCANNERS } from './sources.js';
 
 const HEADER = `# Minotaur settings for this repository. Commit this file.
@@ -43,7 +45,7 @@ export interface ScannerChoice {
 
 export interface ConfigChoices {
   scanners: readonly string[];
-  provider: 'anthropic' | 'openai-compatible' | 'unset';
+  provider: 'anthropic' | 'claude-code' | 'openai-compatible' | 'unset';
   modelId?: string;
   baseUrl?: string;
 }
@@ -160,14 +162,15 @@ export function configuredModel(config: Config): { provider: Provider; modelId: 
   }
 }
 
-export function requireModelId(provider: 'anthropic' | 'openai-compatible', value: string | undefined): string {
+export function requireModelId(provider: 'anthropic' | 'claude-code' | 'openai-compatible', value: string | undefined): string {
   const raw = (value ?? '').trim();
   const prefix = `${provider}:`;
   const id = raw.startsWith(prefix) ? raw.slice(prefix.length).trim() : raw;
   if (!id) throw new Error('a model name is required');
   if (/\s/.test(id)) throw new Error(`model name "${id}" cannot contain spaces`);
-  if (provider === 'anthropic' && !anthropicModels().includes(id)) {
-    throw new Error(`unknown Anthropic model "${id}"; expected one of ${anthropicModels().join(', ')}`);
+  if (provider !== 'openai-compatible' && !anthropicModels().includes(id)) {
+    const kind = provider === 'anthropic' ? 'Anthropic' : 'Claude';
+    throw new Error(`unknown ${kind} model "${id}"; expected one of ${anthropicModels().join(', ')}`);
   }
   return id;
 }
@@ -185,7 +188,7 @@ export function requireBaseUrl(value: string | undefined): string {
 
 /**
  * The next file. Scanner order follows the fleet, so a re-run does not shuffle
- * the diff. Choosing Anthropic drops `baseUrl`; choosing a local server sets it.
+ * the diff. Choosing Anthropic or Claude Code drops `baseUrl`; choosing a local server sets it.
  */
 export function applyChoices(existing: Config, choices: ConfigChoices): Config {
   if (choices.scanners.length === 0) throw new Error('pick at least one scanner');
@@ -207,8 +210,8 @@ export function applyChoices(existing: Config, choices: ConfigChoices): Config {
     ...(existing.triage ? { triage: existing.triage } : {}),
     ...(existing.focus ? { focus: existing.focus } : {}),
   };
-  if (choices.provider === 'anthropic') {
-    next.model = `anthropic:${requireModelId('anthropic', choices.modelId ?? anthropicModels()[0])}`;
+  if (choices.provider === 'anthropic' || choices.provider === 'claude-code') {
+    next.model = `${choices.provider}:${requireModelId(choices.provider, choices.modelId ?? anthropicModels()[0])}`;
   } else if (choices.provider === 'openai-compatible') {
     next.model = `openai-compatible:${requireModelId('openai-compatible', choices.modelId)}`;
     next.baseUrl = requireBaseUrl(choices.baseUrl);
@@ -240,6 +243,27 @@ export async function anthropicReady(env: Env): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** True when the Claude Code ACP adapter can be started: MINOTAUR_ACP_COMMAND is set, or the adapter is on PATH. */
+export async function acpReady(env: Env): Promise<boolean> {
+  if (env['MINOTAUR_ACP_COMMAND']) return true;
+  return isInstalled(DEFAULT_ACP_COMMAND, env['PATH'] ?? '');
+}
+
+export const ACP_INSTALL_COMMAND = `npm install -g ${ACP_PACKAGE}`;
+
+/** Installs the Claude Code ACP adapter with npm. Resolves with npm's exit code. */
+export function installAcpAdapter(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const child = spawn(npm, ['install', '-g', ACP_PACKAGE], { stdio: 'inherit' });
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') reject(new Error(`npm is not installed. Install the adapter with: ${ACP_INSTALL_COMMAND}`));
+      else reject(error);
+    });
+    child.on('exit', (code) => resolve(code ?? 1));
+  });
 }
 
 function toDocument(config: Config): Record<string, unknown> {

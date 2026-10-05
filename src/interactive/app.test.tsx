@@ -87,7 +87,7 @@ function options({
     root: '/repo',
     commit: '3f9a1c2 Fix the login redirect',
     load: async () => ({ findings: [finding], ignored: 0, protectedPaths: new Set(), ...loaded }),
-    model: { ok: true, destination: 'http://localhost:11434/v1 (openai-compatible:fake)', limits: '30 steps' },
+    model: { ok: true, label: 'openai-compatible:fake', destination: 'http://localhost:11434/v1 (openai-compatible:fake)', limits: '30 steps' },
     maxSteps: 30,
     check: () => Promise.reject(new Error('not expected')),
     decide: () => Promise.reject(new Error('not expected')),
@@ -119,6 +119,7 @@ describe('browse', () => {
     expect(screen()).toContain('● 1 high');
     expect(screen()).toContain('3 ignored');
     expect(screen()).toContain('@ 3f9a1c2');
+    expect(screen()).toContain('model openai-compatible:fake');
     expect(screen()).not.toContain('Fix the login redirect');
 
     input.write('\r');
@@ -222,6 +223,16 @@ describe('browse', () => {
     expect(screen()).toContain('1 earlier check still applies.');
     // Escape codes also move the cursor between frames, so they end a line too.
     for (const line of raw().split(ANSI).join('\n').split(/\r?\n/)) expect([...line].length).toBeLessThanOrEqual(60);
+    input.write('q');
+    await done;
+  });
+
+  it('says in the header when no model is set up', async () => {
+    const { input, output, screen } = terminal();
+    const done = browse(options({ model: { ok: false, error: 'No model is configured.' }, input, output }));
+    await tick();
+    expect(screen()).toContain('no model set up');
+    expect(screen()).not.toContain('model openai-compatible');
     input.write('q');
     await done;
   });

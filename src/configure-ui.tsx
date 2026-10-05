@@ -12,11 +12,14 @@ import { useEffect, useRef, useState } from 'react';
 import type { Env } from './auth.js';
 import { loadConfig, type Config } from './config.js';
 import {
+  ACP_INSTALL_COMMAND,
+  acpReady,
   anthropicModels,
   anthropicReady,
   applyChoices,
   configuredModel,
   initialScanners,
+  installAcpAdapter,
   installMissing,
   installWithBrew,
   missingScanners,
@@ -42,6 +45,8 @@ export interface WizardOutcome {
   brew: readonly string[];
   /** Chosen scanners that are not on PATH and that this machine cannot install. */
   separate: readonly string[];
+  /** True when the person asked to install the Claude Code ACP adapter with npm. */
+  installAcp: boolean;
 }
 
 export interface AskConfigOptions {
@@ -50,13 +55,26 @@ export interface AskConfigOptions {
   /** Pre-checked when the file lists no scanners. The same set a scan would run. */
   fallbackScanners: readonly string[];
   anthropicReady: boolean;
+  /** True when the Claude Code ACP adapter can be started. */
+  acpReady?: boolean;
   /** True on a Mac where `brew` is on PATH. Missing scanners can then be installed with Homebrew. */
   canBrew?: boolean;
   input?: NodeJS.ReadableStream & { isTTY?: boolean; setRawMode?: (raw: boolean) => unknown };
   output?: NodeJS.WritableStream & { columns?: number; rows?: number };
 }
 
-type Step = 'sources' | 'install' | 'brew' | 'provider' | 'anthropic' | 'local-model' | 'local-url' | 'confirm' | 'login';
+type Step =
+  | 'sources'
+  | 'install'
+  | 'brew'
+  | 'provider'
+  | 'anthropic'
+  | 'claude-code'
+  | 'local-model'
+  | 'local-url'
+  | 'confirm'
+  | 'login'
+  | 'acp';
 
 export function askConfig(options: AskConfigOptions): Promise<WizardOutcome | null> {
   let outcome: WizardOutcome | null = null;
@@ -86,15 +104,29 @@ export async function configureRepository(options: {
   /** When set, used instead of looking for Homebrew on a Mac. */
   canBrew?: boolean;
   anthropicReady?: boolean;
+  /** When set, used instead of looking for the ACP adapter. */
+  acpReady?: boolean;
+  /** Install the ACP adapter when `answers` is set. The wizard decides this itself. */
+  installAcp?: boolean;
+  /** When set, used instead of `npm install -g`. */
+  acpInstall?: () => Promise<number>;
   input?: AskConfigOptions['input'];
   output?: AskConfigOptions['output'];
 }): Promise<number> {
   const env = options.env ?? process.env;
   const { config } = await loadConfig(options.root);
   const ready = options.anthropicReady ?? (await anthropicReady(env));
+  const adapter = options.acpReady ?? (await acpReady(env));
   const canBrew = options.canBrew ?? (process.platform === 'darwin' && (await isInstalled('brew')));
   const outcome = options.answers
-    ? { choices: options.answers, signIn: options.signIn ?? false, install: options.install ?? [], brew: options.brew ?? [], separate: [] as readonly string[] }
+    ? {
+        choices: options.answers,
+        signIn: options.signIn ?? false,
+        install: options.install ?? [],
+        brew: options.brew ?? [],
+        separate: [] as readonly string[],
+        installAcp: options.installAcp ?? false,
+      }
     : await askConfig({
         config,
         installed: new Set([...(await installedScanners()).map((scanner) => scanner.name), ...(await cachedTools())]),
@@ -102,6 +134,7 @@ export async function configureRepository(options: {
           ? []
           : (await defaultSources(options.root)).flatMap((source) => ('scanner' in source ? [source.scanner] : [])),
         anthropicReady: ready,
+        acpReady: adapter,
         canBrew,
         ...(options.input ? { input: options.input } : {}),
         ...(options.output ? { output: options.output } : {}),
@@ -136,6 +169,24 @@ export async function configureRepository(options: {
   if (separate.length > 0) {
     const pronoun = separate.length === 1 ? 'it' : 'them';
     process.stderr.write(`${nameList(separate)} ${separate.length === 1 ? 'is' : 'are'} not installed. Minotaur cannot download ${pronoun}.\n`);
+  }
+  if (outcome.choices.provider === 'claude-code') {
+    if (outcome.installAcp) {
+      try {
+        const code = await (options.acpInstall ?? installAcpAdapter)();
+        if (code !== 0) {
+          process.stderr.write(`npm did not install the adapter. Install it with: ${ACP_INSTALL_COMMAND}\n`);
+          return 1;
+        }
+        process.stderr.write('Installed the Claude Code ACP adapter.\n');
+      } catch (error) {
+        process.stderr.write(`${(error as Error).message}\n`);
+        return 1;
+      }
+    } else if (!adapter) {
+      process.stderr.write(`Install the Claude Code ACP adapter before a check: ${ACP_INSTALL_COMMAND}\n`);
+    }
+    process.stderr.write('Checks use the Claude account that Claude Code is signed in with. To sign in, run claude, then /login.\n');
   }
   if (outcome.choices.provider === 'anthropic' && !ready) {
     if (outcome.signIn) return (options.login ?? (async () => 0))();
@@ -266,14 +317,16 @@ function Wizard({ options, onFinish }: { options: AskConfigOptions; onFinish: (o
           <Text>Which model should checks and fixes use?</Text>
           <Text dimColor>Enter chooses the highlighted one.</Text>
           <Select
-            visibleOptionCount={3}
+            visibleOptionCount={4}
             options={[
               { label: 'Anthropic', value: 'anthropic' },
+              { label: 'Your Claude subscription, through Claude Code (ACP)', value: 'claude-code' },
               { label: 'A server you run (OpenAI-compatible API)', value: 'openai-compatible' },
               { label: 'Don\'t record a model (MINOTAUR_MODEL still applies)', value: 'unset' },
             ]}
             onChange={(value) => {
               if (value === 'anthropic') advance('anthropic', () => undefined);
+              else if (value === 'claude-code') advance('claude-code', () => undefined);
               else if (value === 'openai-compatible') advance('local-model', () => undefined);
               else advance('confirm', () => setChoices({ scanners, provider: 'unset' }));
             }}
@@ -288,6 +341,18 @@ function Wizard({ options, onFinish }: { options: AskConfigOptions; onFinish: (o
             visibleOptionCount={anthropicModels().length}
             options={modelOptions(current?.provider === 'anthropic' ? current.modelId : null, preferred)}
             onChange={(value) => advance('confirm', () => setChoices({ scanners, provider: 'anthropic', modelId: value }))}
+          />
+        </Box>
+      )}
+      {step === 'claude-code' && (
+        <Box flexDirection="column">
+          <Text>Which Claude model should Claude Code use?</Text>
+          <Text dimColor>Checks run on the Claude account that Claude Code is signed in with. No API key is used.</Text>
+          <Text dimColor>Enter chooses the highlighted one.</Text>
+          <Select
+            visibleOptionCount={anthropicModels().length}
+            options={modelOptions(current?.provider === 'claude-code' ? current.modelId : null, preferred)}
+            onChange={(value) => advance('confirm', () => setChoices({ scanners, provider: 'claude-code', modelId: value }))}
           />
         </Box>
       )}
@@ -327,7 +392,7 @@ function Wizard({ options, onFinish }: { options: AskConfigOptions; onFinish: (o
           />
         </Box>
       )}
-      {(step === 'confirm' || step === 'login') && choices && (
+      {(step === 'confirm' || step === 'login' || step === 'acp') && choices && (
         <Box flexDirection="column">
           <Text>Write this to .minotaur.yml?</Text>
           {previewLines(options.config, choices).map((line, index) => (
@@ -350,7 +415,8 @@ function Wizard({ options, onFinish }: { options: AskConfigOptions; onFinish: (o
               onChange={(value) => {
                 if (value === 'cancel') finish(null);
                 else if (choices.provider === 'anthropic' && !options.anthropicReady) advance('login', () => undefined);
-                else finish({ choices, signIn: false, install, brew, separate });
+                else if (choices.provider === 'claude-code' && options.acpReady === false) advance('acp', () => undefined);
+                else finish({ choices, signIn: false, install, brew, separate, installAcp: false });
               }}
             />
           )}
@@ -363,7 +429,21 @@ function Wizard({ options, onFinish }: { options: AskConfigOptions; onFinish: (o
                   { label: 'Not now', value: 'no' },
                   { label: 'Sign in to the Claude Console', value: 'yes' },
                 ]}
-                onChange={(value) => finish({ choices, signIn: value === 'yes', install, brew, separate })}
+                onChange={(value) => finish({ choices, signIn: value === 'yes', install, brew, separate, installAcp: false })}
+              />
+            </Box>
+          )}
+          {step === 'acp' && (
+            <Box flexDirection="column">
+              <Text>The Claude Code ACP adapter (claude-agent-acp) is not installed. Install it with npm now?</Text>
+              <Text dimColor>{ACP_INSTALL_COMMAND}</Text>
+              <Select
+                visibleOptionCount={2}
+                options={[
+                  { label: 'Install with npm', value: 'yes' },
+                  { label: 'Not now', value: 'no' },
+                ]}
+                onChange={(value) => finish({ choices, signIn: false, install, brew, separate, installAcp: value === 'yes' })}
               />
             </Box>
           )}

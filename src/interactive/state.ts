@@ -19,8 +19,8 @@ export interface Running {
   filesRead: string[];
 }
 
-/** What the model setup allows: where code would go, or why triage cannot run. */
-export type ModelStatus = { ok: true; destination: string; limits: string } | { ok: false; error: string };
+/** What the model setup allows: which model, where code would go, or why triage cannot run. */
+export type ModelStatus = { ok: true; label: string; destination: string; limits: string } | { ok: false; error: string };
 
 export interface BrowserState {
   root: string;

@@ -46,7 +46,7 @@ function state(overrides: Partial<BrowserState> = {}): BrowserState {
       findings,
       ignored: 0,
       protectedPaths: new Set(['config/key.pem']),
-      model: { ok: true, destination: 'http://localhost:11434/v1', limits: '30 steps' },
+      model: { ok: true, label: 'openai-compatible:fake', destination: 'http://localhost:11434/v1', limits: '30 steps' },
     }),
     ...overrides,
   };
